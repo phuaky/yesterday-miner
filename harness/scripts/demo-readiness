@@ -1,0 +1,156 @@
+#!/usr/bin/env bun
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { readSpec, unfulfilledHumanInputs } from "../parser/spec.ts";
+import { mineDateIssues } from "./demo-date.ts";
+import { handoffFromIssues, handoffLines } from "./demo-handoff.ts";
+
+type DemoInput = {
+  mineDate?: string;
+  postSignal?: {
+    text?: string;
+    score?: number;
+    reason?: string;
+  };
+  scoutCandidate?: {
+    username?: string;
+    bio?: string;
+    followers?: number;
+    fitScore?: number;
+    fitReason?: string;
+    contexts?: string[];
+  };
+  postDraft?: string;
+  dmDraft?: string;
+};
+
+const harnessRoot = resolve(import.meta.dir, "..");
+const projectRoot = resolve(harnessRoot, "..");
+const inputPath = resolve(harnessRoot, process.env.DEMO_INPUT_PATH?.trim() || "demo/demo-input.json");
+const resultPath = resolve(harnessRoot, process.env.DEMO_READINESS_RESULT_PATH?.trim() || "test-results/demo-readiness.json");
+const productSpecPath = resolve(projectRoot, process.env.PRODUCT_SPEC_PATH?.trim() || "product.md");
+const voicePath = resolve(harnessRoot, "voice/profile.md");
+const envPath = resolve(harnessRoot, ".env");
+
+const placeholderValues = new Set([
+  "your_product",
+  "Your Name",
+  "your target audience",
+  "your_handle",
+  "<set>",
+]);
+
+function isPlaceholderText(value: string | undefined): boolean {
+  const trimmed = value?.trim() ?? "";
+  return !trimmed || /^<[^>]+>$/.test(trimmed) || trimmed.toLowerCase().includes("optional:");
+}
+
+function envValue(name: string): string {
+  return process.env[name]?.trim() ?? "";
+}
+
+function envMissing(name: string): boolean {
+  const value = envValue(name);
+  return !value || placeholderValues.has(value);
+}
+
+function inputIssues(input: DemoInput | null): string[] {
+  if (!input) {
+    return [];
+  }
+
+  const issues: string[] = [];
+  issues.push(...mineDateIssues("demo input", input.mineDate));
+  if (isPlaceholderText(input.postSignal?.text)) issues.push("demo input needs real postSignal.text");
+  if (isPlaceholderText(input.postSignal?.reason)) issues.push("demo input needs real postSignal.reason");
+  if (isPlaceholderText(input.scoutCandidate?.username)) issues.push("demo input needs real scoutCandidate.username");
+  if (isPlaceholderText(input.scoutCandidate?.fitReason)) issues.push("demo input needs real scoutCandidate.fitReason");
+  if (input.scoutCandidate?.bio && isPlaceholderText(input.scoutCandidate.bio)) issues.push("demo input scoutCandidate.bio is still placeholder text");
+  if (input.scoutCandidate?.contexts?.some(isPlaceholderText)) issues.push("demo input scoutCandidate.contexts contains placeholder text");
+  return issues;
+}
+
+function readInput(): { input: DemoInput | null; issues: string[] } {
+  if (!existsSync(inputPath)) {
+    return {
+      input: null,
+      issues: [
+        `Create ${inputPath}`,
+        "Use /Users/pky/No-AI/harness/docs/demo-input.example.json as the shape.",
+      ],
+    };
+  }
+
+  try {
+    return {
+      input: JSON.parse(readFileSync(inputPath, "utf8")) as DemoInput,
+      issues: [],
+    };
+  } catch {
+    return {
+      input: null,
+      issues: [`${inputPath} must be valid JSON matching /Users/pky/No-AI/harness/docs/demo-input.example.json`],
+    };
+  }
+}
+
+function productSpecIssues(): string[] {
+  if (!existsSync(productSpecPath)) return [`product spec missing at ${productSpecPath}`];
+
+  try {
+    const missing = unfulfilledHumanInputs(readSpec(productSpecPath));
+    return missing.map((input) => `product.md §5 What I need from you unresolved: ${input}`);
+  } catch {
+    return [`product spec at ${productSpecPath} must parse as the 8-section markdown loop`];
+  }
+}
+
+const envIssues = [
+  ...["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "PRODUCT_NAME", "OPERATOR_NAME", "TARGET_AUDIENCE"]
+    .filter(envMissing)
+    .map((name) => `harness/.env missing real ${name}`),
+  ...(envValue("DRY_RUN") === "1" ? [] : ["harness/.env must set DRY_RUN=1"]),
+  ...(envValue("KILL_SWITCH") === "1" ? ["harness/.env must set KILL_SWITCH=0"] : []),
+];
+const { input, issues: inputReadIssues } = readInput();
+const issues = [...envIssues, ...productSpecIssues(), ...inputReadIssues, ...inputIssues(input)];
+const handoff = handoffFromIssues(issues, { envPath, inputPath, productSpecPath });
+const aiComposerReady = Boolean(envValue("OPENAI_API_KEY")) && existsSync(voicePath);
+const draftMode = aiComposerReady ? "ai-composer" : "local-template-fallback";
+const status = issues.length === 0 ? "ready" : "blocked";
+
+const result = {
+  status,
+  checkedAt: new Date().toISOString(),
+  harnessRoot,
+  projectRoot,
+  inputPath,
+  productSpecPath,
+  draftMode,
+  missingOrInvalid: issues,
+  handoff,
+  safetyEvidence: {
+    livePublishAttempted: false,
+    autoDmAttempted: false,
+    telegramMessagesSent: false,
+    secretValuesPrinted: false,
+  },
+};
+
+mkdirSync(dirname(resultPath), { recursive: true });
+writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+
+if (status === "ready") {
+  console.log(`PASS demo ready (${draftMode})`);
+} else {
+  console.log("BLOCKED demo setup is incomplete");
+  for (const issue of issues) console.log(`  - ${issue}`);
+  if (handoff.length > 0) {
+    console.log("handoff:");
+    for (const line of handoffLines(handoff)) console.log(`  - ${line}`);
+  }
+}
+console.log(`wrote: ${resultPath.replace(`${harnessRoot}/`, "")}`);
+
+if (status !== "ready") process.exit(1);

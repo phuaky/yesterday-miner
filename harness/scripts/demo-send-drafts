@@ -1,0 +1,306 @@
+#!/usr/bin/env bun
+
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { composePersonal } from "../miner/compose-personal.ts";
+import type { ScoredMoment } from "../miner/score.ts";
+import { readSpec, unfulfilledHumanInputs } from "../parser/spec.ts";
+import { contentFilter, dryRunActive } from "../publish/safety.ts";
+import { composeDm } from "../scout/dm-compose.ts";
+import type { ScoredCandidate } from "../scout/fit-score.ts";
+import { registerDraft } from "../telegram/bot.ts";
+import { draftId, sendDraft, type Draft } from "../telegram/send.ts";
+import { mineDateIssues } from "./demo-date.ts";
+import { handoffFromIssues, handoffLines } from "./demo-handoff.ts";
+
+type DemoInput = {
+  mineDate: string;
+  postSignal: {
+    text: string;
+    score?: number;
+    reason: string;
+  };
+  scoutCandidate: {
+    username: string;
+    bio?: string;
+    followers?: number;
+    fitScore?: number;
+    fitReason: string;
+    contexts?: string[];
+  };
+  postDraft?: string;
+  dmDraft?: string;
+};
+
+const harnessRoot = resolve(import.meta.dir, "..");
+const projectRoot = resolve(harnessRoot, "..");
+const inputPath = resolve(harnessRoot, process.env.DEMO_INPUT_PATH?.trim() || "demo/demo-input.json");
+const resultPath = resolve(harnessRoot, process.env.DEMO_SEND_RESULT_PATH?.trim() || "test-results/demo-send-drafts.json");
+const approvalEvidencePath = resolve(harnessRoot, "test-results/telegram-approval-evidence.json");
+const approvalProofPath = resolve(harnessRoot, "test-results/demo-approval-proof.json");
+const voicePath = resolve(harnessRoot, "voice/profile.md");
+const productSpecPath = resolve(projectRoot, process.env.PRODUCT_SPEC_PATH?.trim() || "product.md");
+const envPath = resolve(harnessRoot, ".env");
+const placeholderValues = new Set([
+  "your_product",
+  "Your Name",
+  "your target audience",
+  "your_handle",
+  "<set>",
+]);
+
+function isPlaceholderText(value: string | undefined): boolean {
+  const trimmed = value?.trim() ?? "";
+  return !trimmed || /^<[^>]+>$/.test(trimmed) || trimmed.toLowerCase().includes("optional:");
+}
+
+function optionalRealText(value: string | undefined): string | null {
+  return isPlaceholderText(value) ? null : value!.trim();
+}
+
+function hasValue(name: string): boolean {
+  const value = process.env[name]?.trim() ?? "";
+  return Boolean(value) && !placeholderValues.has(value);
+}
+
+function fail(message: string, details: string[] = []): never {
+  const handoff = handoffFromIssues(details, { envPath, inputPath, productSpecPath });
+  mkdirSync(dirname(resultPath), { recursive: true });
+  writeFileSync(resultPath, `${JSON.stringify({
+    status: "blocked",
+    checkedAt: new Date().toISOString(),
+    harnessRoot,
+    projectRoot,
+    reason: message,
+    missingOrInvalid: details,
+    handoff,
+    safetyEvidence: {
+      livePublishAttempted: false,
+      autoDmAttempted: false,
+      secretValuesPrinted: false,
+    },
+  }, null, 2)}\n`);
+
+  console.error(`FAIL ${message}`);
+  for (const detail of details) console.error(`  - ${detail}`);
+  if (handoff.length > 0) {
+    console.error("handoff:");
+    for (const line of handoffLines(handoff)) console.error(`  - ${line}`);
+  }
+  console.error(`wrote: ${resultPath.replace(`${harnessRoot}/`, "")}`);
+  process.exit(1);
+}
+
+function writeAttempt(status: "sending" | "failed", details: string[] = [], drafts: Array<{ id: string; lane: string; date: string; routedTo: string }> = []): void {
+  mkdirSync(dirname(resultPath), { recursive: true });
+  writeFileSync(resultPath, `${JSON.stringify({
+    status,
+    checkedAt: new Date().toISOString(),
+    harnessRoot,
+    projectRoot,
+    inputPath,
+    productSpecPath,
+    dryRun: dryRunActive(),
+    drafts,
+    missingOrInvalid: details,
+    safetyEvidence: {
+      livePublishAttempted: false,
+      autoDmAttempted: false,
+      secretValuesPrinted: false,
+      draftBodiesRecorded: false,
+      scoutDmManualOnly: true,
+    },
+  }, null, 2)}\n`);
+}
+
+function inputIssues(input: DemoInput): string[] {
+  const missing: string[] = [];
+  missing.push(...mineDateIssues("demo/demo-input.json", input.mineDate));
+  if (isPlaceholderText(input.postSignal?.text)) missing.push("demo/demo-input.json needs real postSignal.text");
+  if (isPlaceholderText(input.postSignal?.reason)) missing.push("demo/demo-input.json needs real postSignal.reason");
+  if (isPlaceholderText(input.scoutCandidate?.username)) missing.push("demo/demo-input.json needs real scoutCandidate.username");
+  if (isPlaceholderText(input.scoutCandidate?.fitReason)) missing.push("demo/demo-input.json needs real scoutCandidate.fitReason");
+  if (input.scoutCandidate?.bio && isPlaceholderText(input.scoutCandidate.bio)) missing.push("demo/demo-input.json scoutCandidate.bio is still placeholder text");
+  if (input.scoutCandidate?.contexts?.some(isPlaceholderText)) missing.push("demo/demo-input.json scoutCandidate.contexts contains placeholder text");
+  return missing;
+}
+
+function readInputIfPresent(): { input: DemoInput | null; issues: string[] } {
+  if (!existsSync(inputPath)) {
+    return {
+      input: null,
+      issues: [
+        `Create ${inputPath}`,
+        "Use the JSON shape documented in /Users/pky/No-AI/harness/docs/operator-dry-run-demo.md",
+      ],
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(inputPath, "utf8")) as DemoInput;
+    return { input: parsed, issues: inputIssues(parsed) };
+  } catch {
+    return {
+      input: null,
+      issues: [`${inputPath} must be valid JSON matching /Users/pky/No-AI/harness/docs/demo-input.example.json`],
+    };
+  }
+}
+
+function envIssues(): string[] {
+  const missing = [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "PRODUCT_NAME",
+    "OPERATOR_NAME",
+    "TARGET_AUDIENCE",
+  ].filter((key) => !hasValue(key));
+
+  if (!dryRunActive()) missing.push("DRY_RUN=1");
+  if (process.env.KILL_SWITCH === "1") missing.push("KILL_SWITCH=0");
+  return missing.map((item) => `harness/.env missing or invalid ${item}`);
+}
+
+function productSpecIssues(): string[] {
+  if (!existsSync(productSpecPath)) return [`product spec missing at ${productSpecPath}`];
+
+  try {
+    const missing = unfulfilledHumanInputs(readSpec(productSpecPath));
+    return missing.map((input) => `product.md §5 What I need from you unresolved: ${input}`);
+  } catch {
+    return [`product spec at ${productSpecPath} must parse as the 8-section markdown loop`];
+  }
+}
+
+function clip(text: string, maxLength: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLength) return compact;
+  return compact.slice(0, Math.max(0, maxLength - 3)).trimEnd() + "...";
+}
+
+function localPostDraft(input: DemoInput): string {
+  const reason = input.postSignal.reason.replace(/[.?!]\s*$/, "");
+  return clip(`Yesterday's signal: ${input.postSignal.text} Useful because ${reason}.`, 280);
+}
+
+function localDmDraft(input: DemoInput): string {
+  const product = process.env.PRODUCT_NAME?.trim() || "the product";
+  const bioText = optionalRealText(input.scoutCandidate.bio);
+  const bio = bioText ? ` Saw your context: ${bioText}.` : "";
+  return clip(`Hey @${input.scoutCandidate.username} -${bio} ${product} may fit because ${input.scoutCandidate.fitReason}. Curious if I should send the short version?`, 350);
+}
+
+async function postBody(input: DemoInput): Promise<string> {
+  const manualDraft = optionalRealText(input.postDraft);
+  if (manualDraft) return manualDraft;
+  if (!hasValue("OPENAI_API_KEY") || !existsSync(voicePath)) return localPostDraft(input);
+
+  const moment: ScoredMoment = {
+    source: "x",
+    score: input.postSignal.score ?? 8,
+    reason: input.postSignal.reason,
+    raw: input.postSignal,
+    excerpt: input.postSignal.text,
+  };
+  return composePersonal(moment, input.mineDate);
+}
+
+async function dmBody(input: DemoInput): Promise<string> {
+  const manualDraft = optionalRealText(input.dmDraft);
+  if (manualDraft) return manualDraft;
+  if (!hasValue("OPENAI_API_KEY")) return localDmDraft(input);
+
+  const candidate: ScoredCandidate = {
+    username: input.scoutCandidate.username,
+    firstSeen: input.mineDate,
+    contexts: input.scoutCandidate.contexts?.filter((context) => !isPlaceholderText(context)) ?? [],
+    signalCount: Math.max(1, input.scoutCandidate.contexts?.length ?? 1),
+    bio: optionalRealText(input.scoutCandidate.bio) ?? "",
+    followers: input.scoutCandidate.followers ?? 0,
+    fitScore: input.scoutCandidate.fitScore ?? 8,
+    fitReason: input.scoutCandidate.fitReason,
+  };
+  return composeDm(candidate);
+}
+
+const { input, issues: inputSetupIssues } = readInputIfPresent();
+const setupIssues = [...envIssues(), ...productSpecIssues(), ...inputSetupIssues];
+if (setupIssues.length > 0 || !input) fail("demo setup is incomplete", setupIssues);
+
+const post = await postBody(input);
+const filter = contentFilter(post);
+if (!filter.ok) fail("post draft failed content filter", [filter.reason ?? "unknown reason"]);
+
+const dm = await dmBody(input);
+const candidate = input.scoutCandidate;
+const postDraft: Draft = {
+  id: draftId({ lane: "personal", date: input.mineDate, body: post }),
+  lane: "personal",
+  date: input.mineDate,
+  body: post,
+  meta: {
+    source: "operator-dry-run-demo",
+    signalReason: input.postSignal.reason,
+  },
+};
+const scoutBody = `@${candidate.username} (fit ${candidate.fitScore ?? 8}/10) - ${candidate.fitReason}\n\n---\n\n${dm}`;
+const scoutDraft: Draft = {
+  id: draftId({ lane: "scout-lead", date: `@${candidate.username}`, body: scoutBody }),
+  lane: "scout-lead",
+  date: `@${candidate.username}`,
+  body: scoutBody,
+  meta: {
+    source: "operator-dry-run-demo",
+    username: candidate.username,
+    fitScore: candidate.fitScore ?? 8,
+  },
+};
+
+const routedDrafts = [
+  { id: postDraft.id, lane: postDraft.lane, date: postDraft.date, routedTo: "Telegram approval inbox" },
+  { id: scoutDraft.id, lane: scoutDraft.lane, date: scoutDraft.date, routedTo: "Telegram manual DM review" },
+];
+
+writeAttempt("sending", [], routedDrafts);
+
+for (const stalePath of [approvalEvidencePath, approvalProofPath]) {
+  if (existsSync(stalePath)) rmSync(stalePath);
+}
+
+registerDraft(postDraft);
+registerDraft(scoutDraft);
+
+try {
+  await sendDraft(postDraft);
+  await sendDraft(scoutDraft);
+} catch {
+  writeAttempt("failed", ["Telegram draft send failed; check TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, network access, and bot permissions."], routedDrafts);
+  console.error("FAIL Telegram draft send failed");
+  console.error(`wrote: ${resultPath.replace(`${harnessRoot}/`, "")}`);
+  process.exit(1);
+}
+
+const result = {
+  status: "sent",
+  checkedAt: new Date().toISOString(),
+  harnessRoot,
+  projectRoot,
+  inputPath,
+  productSpecPath,
+  dryRun: dryRunActive(),
+  drafts: routedDrafts,
+  safetyEvidence: {
+    livePublishAttempted: false,
+    autoDmAttempted: false,
+    secretValuesPrinted: false,
+    scoutDmManualOnly: true,
+  },
+};
+
+mkdirSync(dirname(resultPath), { recursive: true });
+writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+
+console.log("PASS sent personal post draft to Telegram");
+console.log("PASS sent manual Scout DM draft to Telegram");
+console.log("result: sent");
+console.log(`wrote: ${resultPath.replace(`${harnessRoot}/`, "")}`);

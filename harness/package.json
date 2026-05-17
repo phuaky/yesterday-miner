@@ -12,6 +12,14 @@
     "ingest:x": "bun ingest/x-fetch.ts",
     "ingest:discord": "bun ingest/discord-fetch.ts",
     "ingest:voice": "bun ingest/voice-profile.ts",
+    "demo:bootstrap": "bun scripts/demo-bootstrap",
+    "demo:safety": "bun scripts/demo-local-safety",
+    "demo:ready": "bun scripts/demo-readiness",
+    "demo:send": "bun scripts/demo-send-drafts",
+    "demo:proof": "bun scripts/demo-approval-proof",
+    "demo:run": "bun scripts/demo-run",
+    "demo:operator": "bun scripts/demo-operator",
+    "demo:status": "bun scripts/demo-status",
     "verify": "bun scripts/verify-harness"
   },
   "dependencies": {

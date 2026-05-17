@@ -1,0 +1,124 @@
+#!/usr/bin/env bun
+
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+
+const harnessRoot = resolve(import.meta.dir, "..");
+const resultPath = resolve(harnessRoot, "test-results/demo-operator.json");
+const proofPath = resolve(harnessRoot, "test-results/demo-approval-proof.json");
+const timeoutSeconds = Number(process.env.DEMO_OPERATOR_TIMEOUT_SECONDS ?? 300);
+
+function writeResult(status: string, stage: string, details: string[] = []): void {
+  mkdirSync(dirname(resultPath), { recursive: true });
+  const proof = readProofArtifact();
+  writeFileSync(resultPath, `${JSON.stringify({
+    status,
+    stage,
+    checkedAt: new Date().toISOString(),
+    harnessRoot,
+    timeoutSeconds,
+    details,
+    proof,
+    safetyEvidence: {
+      livePublishAttempted: false,
+      autoDmAttempted: false,
+      secretValuesPrinted: false,
+    },
+  }, null, 2)}\n`);
+}
+
+function readProofArtifact(): unknown {
+  if (!existsSync(proofPath)) return null;
+  try {
+    return JSON.parse(readFileSync(proofPath, "utf8")) as unknown;
+  } catch {
+    return { status: "invalid" };
+  }
+}
+
+function runRequired(stage: string, args: string[]): boolean {
+  console.log(`\n== ${stage} ==`);
+  const result = spawnSync("bun", args, {
+    cwd: harnessRoot,
+    env: process.env,
+    stdio: "inherit",
+  });
+  if (result.status !== 0) {
+    writeResult("blocked", stage, [`${stage} exited ${result.status ?? "unknown"}`]);
+    return false;
+  }
+  return true;
+}
+
+function startBot(): ChildProcess {
+  console.log("\n== bot ==");
+  return spawn("bun", ["run", "bot"], {
+    cwd: harnessRoot,
+    env: process.env,
+    stdio: "inherit",
+  });
+}
+
+function proofPassed(): boolean {
+  const result = spawnSync("bun", ["run", "demo:proof"], {
+    cwd: harnessRoot,
+    env: process.env,
+    stdio: "pipe",
+    encoding: "utf8",
+  });
+  if (result.status === 0) {
+    process.stdout.write(result.stdout);
+    process.stderr.write(result.stderr);
+    return true;
+  }
+  return false;
+}
+
+if (!runRequired("readiness", ["run", "demo:ready"])) process.exit(1);
+if (!runRequired("send drafts", ["run", "demo:send"])) process.exit(1);
+
+const bot = startBot();
+let botExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+bot.once("exit", (code, signal) => {
+  botExit = { code, signal };
+});
+console.log("\nWaiting for Telegram callbacks.");
+console.log("In Telegram: click Post on the personal draft, then click STOP during grace or let the dry-run finish.");
+
+const started = Date.now();
+let passed = false;
+try {
+  while (Date.now() - started < timeoutSeconds * 1000) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5000));
+    if (botExit) break;
+    if (proofPassed()) {
+      passed = true;
+      break;
+    }
+  }
+} finally {
+  bot.kill("SIGTERM");
+}
+
+if (passed) {
+  writeResult("pass", "proof");
+  console.log("PASS operator dry-run demo");
+  console.log("wrote: test-results/demo-operator.json");
+} else if (botExit) {
+  writeResult("blocked", "bot-exited", [
+    "Telegram bot process exited before approval proof passed.",
+    `Bot exit code: ${botExit.code ?? "none"}; signal: ${botExit.signal ?? "none"}.`,
+  ]);
+  console.log("BLOCKED operator dry-run demo");
+  console.log("wrote: test-results/demo-operator.json");
+  process.exit(1);
+} else {
+  writeResult("blocked", "proof-timeout", [
+    "Timed out waiting for demo:proof to pass.",
+    "Confirm the bot was polling and Telegram callbacks were clicked.",
+  ]);
+  console.log("BLOCKED operator dry-run demo");
+  console.log("wrote: test-results/demo-operator.json");
+  process.exit(1);
+}

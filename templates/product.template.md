@@ -1,23 +1,23 @@
 # Product Ops Template
 
-## 1. Current State
+## 1. Goal
 
-Describe the product, campaign, customer, and current workflow. Keep private details in your local copy, not in the public template.
+Describe the product, campaign, customer, and current workflow goal. Keep private details in your local copy, not in the public template.
 
-## 2. Ideal State / Definition of Done
+## 2. Done
 
 - [ ] The harness can identify high-signal moments or prospects for this product.
 - [ ] Drafts are useful enough for an operator to approve, edit, or skip quickly.
 - [ ] No live post can happen without approval, content filtering, daily cap checks, and STOP grace period.
 - [ ] Runtime state, drafts, prospect data, credentials, and generated voice profiles remain uncommitted.
 
-## 3. Gap
+## 3. Observe
 
-List the gap between the current workflow and the ideal operating loop.
+Observe the gap between the current workflow and the ideal operating loop.
 
-## 4. Options Considered
+## 4. Think
 
-Document the product channels, data sources, and outreach/content strategies considered.
+Think through the product channels, data sources, and outreach/content strategies considered.
 
 ## 5. Plan
 
@@ -36,11 +36,11 @@ Document the product channels, data sources, and outreach/content strategies con
 - [ ] Review Telegram drafts.
 - [ ] Run verifier.
 
-## 6. Execute Log
+## 6. Execute
 
 <!-- Newest entries first. Runtime appends here only in your private product spec. -->
 
-## 7. Verification
+## 7. Verify
 
 Run:
 
@@ -56,6 +56,6 @@ Manual checks:
 - STOP cancels during the grace window.
 - Private files are ignored by git.
 
-## 8. Retrospective
+## 8. Reflect-if-passed
 
 After a dry run or live run, record what worked, what failed, and whether to ship, revise, or stop.

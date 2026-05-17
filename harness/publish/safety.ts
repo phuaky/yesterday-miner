@@ -17,11 +17,13 @@ export function dryRunActive(): boolean {
 }
 
 export function dailyCap(): number {
-  return Number(process.env.DAILY_POST_CAP ?? 5);
+  const parsed = Number(process.env.DAILY_POST_CAP ?? 5);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 5;
 }
 
 export function gracePeriodSeconds(): number {
-  return Number(process.env.GRACE_PERIOD_SECONDS ?? 60);
+  const parsed = Number(process.env.GRACE_PERIOD_SECONDS ?? 60);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60;
 }
 
 function readCounter(): Counter {
@@ -48,7 +50,8 @@ export function checkPrePublish(): string | null {
 
   let c = readCounter();
   if (c.date !== today()) c = { date: today(), count: 0 };
-  if (c.count >= dailyCap()) return `daily cap reached (${c.count}/${dailyCap()})`;
+  const cap = dailyCap();
+  if (c.count >= cap) return `daily cap reached (${c.count}/${cap})`;
 
   return null;
 }

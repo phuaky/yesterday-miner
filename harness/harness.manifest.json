@@ -49,7 +49,7 @@
       "command": "bun telegram/bot.ts",
       "purpose": "Long-poll Telegram callback handler for approve, edit, redraft, skip, and stop actions.",
       "sideEffects": ["telegram-read", "telegram-send", "x-post-after-approval", "spec-log-write", "pending-draft-write", "counter-write"],
-      "safetyRequired": ["DRY_RUN", "KILL_SWITCH", "content-filter", "daily-cap", "grace-period-stop"]
+      "safetyRequired": ["DRY_RUN", "KILL_SWITCH", "content-filter", "pre-publish-checks", "daily-cap", "grace-period-stop"]
     },
     {
       "name": "verify",
@@ -64,8 +64,9 @@
     { "name": "TELEGRAM_CHAT_ID", "secret": true, "requiredFor": ["telegram-approval", "dry-run-mine"] },
     { "name": "APIFY_TOKEN", "secret": true, "requiredFor": ["ingest:x", "scout-enrichment"] },
     { "name": "X_HANDLE", "secret": false, "requiredFor": ["x-cache", "publish-url", "voice-profile"] },
-    { "name": "X_API_KEY", "secret": true, "requiredFor": ["live-publish"] },
-    { "name": "X_API_SECRET", "secret": true, "requiredFor": ["live-publish"] },
+    { "name": "X_BEARER_TOKEN", "secret": true, "requiredFor": ["official-x-api"] },
+    { "name": "X_CONSUMER_KEY", "secret": true, "requiredFor": ["live-publish"] },
+    { "name": "X_CONSUMER_SECRET", "secret": true, "requiredFor": ["live-publish"] },
     { "name": "X_ACCESS_TOKEN", "secret": true, "requiredFor": ["live-publish"] },
     { "name": "X_ACCESS_TOKEN_SECRET", "secret": true, "requiredFor": ["live-publish"] },
     { "name": "DISCORD_USER_TOKEN", "secret": true, "requiredFor": ["ingest:discord"] },
@@ -108,6 +109,7 @@
     { "path": "../campaigns/", "policy": "ignored-private-campaigns" },
     { "path": "../drafts/", "policy": "ignored-private-drafts" },
     { "path": "cache/", "policy": "ignored-runtime-cache" },
+    { "path": "voice/", "policy": "ignored-generated-voice-runtime" },
     { "path": "voice/profile.md", "policy": "ignored-generated-profile" },
     { "path": "voice/corpus.jsonl", "policy": "ignored-generated-corpus" },
     { "path": "log/", "policy": "ignored-runtime-logs" },
@@ -123,8 +125,20 @@
       "behavior": "If DRY_RUN=1, Telegram approval callbacks report the would-post text and do not call publishX."
     },
     {
+      "name": "content-filter",
+      "behavior": "Draft bodies must pass contentFilter before a post can enter the publish grace window."
+    },
+    {
+      "name": "pre-publish-checks",
+      "behavior": "checkPrePublish runs after content filtering and before any live X publish attempt."
+    },
+    {
       "name": "telegram-approval-before-publish",
       "behavior": "publishX is only reachable from telegram/bot.ts after an approve callback, content filter, pre-publish guard, and grace period."
+    },
+    {
+      "name": "telegram-approval-before-any-send",
+      "behavior": "Operator-facing drafts are sent only to the configured Telegram approval inbox; Scout DMs are not sent to prospects."
     },
     {
       "name": "grace-period-stop",
@@ -137,6 +151,18 @@
     {
       "name": "manual-dm-only",
       "behavior": "Scout drafts cold DMs to Telegram; it does not auto-send X DMs."
+    },
+    {
+      "name": "generated-voice-profile-ignored",
+      "behavior": "Generated voice artifacts under voice/ stay ignored and are not part of source-controlled product content."
+    },
+    {
+      "name": "no-secret-printing",
+      "behavior": "Local verification reports key names and safety evidence only; it does not print secret values."
+    },
+    {
+      "name": "no-runtime-mutation",
+      "behavior": "Local verification writes only test-results/.last-run.json and does not mutate private product, campaign, draft, cache, voice, or log state."
     }
   ],
   "readinessGate": [

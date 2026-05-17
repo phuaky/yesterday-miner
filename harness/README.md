@@ -32,6 +32,29 @@ DRY_RUN=1 LOOKBACK_DAYS=3 bun ralph
 bun verify
 ```
 
+## Operator Dry-Run Demo
+
+Use this before any live publishing. It proves the safety path locally, then sends one post draft and one manual Scout DM draft to Telegram when private inputs are filled.
+
+```bash
+cd /Users/pky/No-AI/harness
+bun run demo:safety     # fake Telegram, no external APIs
+bun run demo:bootstrap  # creates ignored demo input placeholder if needed
+bun run demo:ready      # validates ignored private inputs, no sends
+bun run demo:send       # real Telegram dry-run, requires ignored demo/demo-input.json
+bun run demo:run        # readiness + send, then waits for Telegram callbacks
+bun run demo:operator   # guided send + bot + proof wait loop
+bun run demo:proof      # verifies approval/STOP evidence after Telegram callbacks
+bun run demo:status     # redacted current demo status and next command
+```
+
+See `docs/operator-dry-run-demo.md` for the exact private input shape.
+Use `docs/demo.env.example` for the minimal dry-run `.env` shape.
+`demo:ready` also blocks until `../product.md` has no unresolved §5 **What I need from you** handoff items.
+The demo input `mineDate` must be yesterday's date for the operator dry run.
+When blocked, `demo:ready` and `demo:status` write a redacted `handoff` list with each missing input's path and required format.
+After drafts are sent, `demo:status` separates incomplete/failed Telegram sends, pending approval proof, and failed local verifier/safety gates, then prints the exact next command.
+
 ## Kill Switches
 
 - `DRY_RUN=1` - drafts only, no X posts

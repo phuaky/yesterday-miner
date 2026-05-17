@@ -1,0 +1,811 @@
+#!/usr/bin/env bun
+
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import type TelegramBot from "node-telegram-bot-api";
+import { draftMessagePayload, type Draft } from "../telegram/send.ts";
+
+const harnessRoot = resolve(import.meta.dir, "..");
+const resultPath = resolve(harnessRoot, "test-results/demo-local-safety.json");
+const approvalEvidencePath = resolve(harnessRoot, "test-results/telegram-approval-evidence.json");
+const localDemoInputPath = resolve(harnessRoot, "test-results/local-safety-demo-input.json");
+const unsafeDemoInputPath = resolve(harnessRoot, "test-results/local-safety-demo-input-unsafe.json");
+const unresolvedProductPath = resolve(harnessRoot, "test-results/local-safety-product-unresolved.md");
+const resolvedProductPath = resolve(harnessRoot, "test-results/local-safety-product-resolved.md");
+const logProductPath = resolve(harnessRoot, "test-results/local-safety-product-log.md");
+const proofSendPath = resolve(harnessRoot, "test-results/local-safety-proof-send.json");
+const proofEvidencePath = resolve(harnessRoot, "test-results/local-safety-proof-evidence.json");
+
+process.env.DRY_RUN = "1";
+process.env.KILL_SWITCH = "0";
+process.env.DAILY_POST_CAP = "10";
+process.env.GRACE_PERIOD_SECONDS = "1";
+process.env.PRODUCT_SPEC_PATH = "harness/test-results/local-safety-product-log.md";
+if (existsSync(approvalEvidencePath)) rmSync(approvalEvidencePath);
+
+type SentMessage = {
+  chatId: number;
+  text: string;
+  hasStopButton: boolean;
+};
+
+class FakeBot {
+  answers: string[] = [];
+  messages: SentMessage[] = [];
+
+  async answerCallbackQuery(_id: string, options?: { text?: string }): Promise<true> {
+    this.answers.push(options?.text ?? "");
+    return true;
+  }
+
+  async sendMessage(chatId: number, text: string, options?: { reply_markup?: unknown }): Promise<unknown> {
+    this.messages.push({
+      chatId,
+      text,
+      hasStopButton: JSON.stringify(options?.reply_markup ?? {}).includes("stop:"),
+    });
+    return { message_id: this.messages.length };
+  }
+}
+
+function callback(data: string): TelegramBot.CallbackQuery {
+  return {
+    id: `query-${data}`,
+    data,
+    from: { id: 1, is_bot: false, first_name: "Local" },
+    chat_instance: "local-demo",
+    message: {
+      message_id: 1,
+      date: 0,
+      chat: { id: 12345, type: "private" },
+    } as TelegramBot.Message,
+  };
+}
+
+function draft(id: string, lane: Draft["lane"], body: string): Draft {
+  return {
+    id,
+    lane,
+    date: "2026-05-16",
+    body,
+    meta: { source: "demo-local-safety" },
+  };
+}
+
+async function waitForGraceWindow(): Promise<void> {
+  await new Promise((resolveWait) => setTimeout(resolveWait, 1200));
+}
+
+function productSpec(unresolved: boolean): string {
+  const handoff = unresolved
+    ? "- **Product brief**: Put this in §5 during local safety testing."
+    : "- No human inputs required for this local safety fixture.";
+  return `# Local Safety Product
+
+## 1. Goal
+Local safety fixture.
+
+## 2. Done
+- [ ] Local fixture parses.
+
+## 3. Observe
+Local fixture.
+
+## 4. Think
+Local fixture.
+
+## 5. Plan
+**What I need from you**
+${handoff}
+
+**My next steps**
+- [ ] Run local fixture check.
+
+**Your parallel work**
+- [ ] None.
+
+## 6. Execute
+Local fixture.
+
+## 7. Verify
+Local fixture.
+
+## 8. Reflect-if-passed
+`;
+}
+
+function readinessFixtureInput(): string {
+  return `${JSON.stringify({
+    mineDate: "2026-05-16",
+    postSignal: {
+      text: "Local safety signal from a fake yesterday fixture.",
+      score: 8,
+      reason: "It proves readiness gating without using private content.",
+    },
+    scoutCandidate: {
+      username: "local_fixture",
+      bio: "Public local fixture context.",
+      followers: 0,
+      fitScore: 8,
+      fitReason: "Local fit fixture for manual-only DM checks.",
+      contexts: ["local fixture context"],
+    },
+  }, null, 2)}\n`;
+}
+
+function unsafeContentFixtureInput(): string {
+  return `${JSON.stringify({
+    mineDate: "2026-05-16",
+    postSignal: {
+      text: "Local safety signal from a fake yesterday fixture.",
+      score: 8,
+      reason: "It proves unsafe content is blocked before Telegram routing.",
+    },
+    scoutCandidate: {
+      username: "local_fixture",
+      bio: "Public local fixture context.",
+      followers: 0,
+      fitScore: 8,
+      fitReason: "Local fit fixture for manual-only DM checks.",
+      contexts: ["local fixture context"],
+    },
+    postDraft: "Unsafe local fixture contact test@example.com before posting.",
+  }, null, 2)}\n`;
+}
+
+function runReadinessFixture(productPath: string, resultName: string): { exitCode: number; output: string } {
+  const result = Bun.spawnSync(["bun", "scripts/demo-readiness"], {
+    cwd: harnessRoot,
+    env: {
+      ...process.env,
+      TELEGRAM_BOT_TOKEN: "local-test-token",
+      TELEGRAM_CHAT_ID: "12345",
+      PRODUCT_NAME: "Local Safety Product",
+      OPERATOR_NAME: "Local Operator",
+      TARGET_AUDIENCE: "Local fixture audience",
+      PRODUCT_SPEC_PATH: productPath.replace(resolve(harnessRoot, "..") + "/", ""),
+      DEMO_INPUT_PATH: "test-results/local-safety-demo-input.json",
+      DEMO_READINESS_RESULT_PATH: `test-results/${resultName}`,
+      DEMO_EXPECTED_MINE_DATE: "2026-05-16",
+      DRY_RUN: "1",
+      KILL_SWITCH: "0",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  return {
+    exitCode: result.exitCode,
+    output: `${result.stdout.toString()}${result.stderr.toString()}`,
+  };
+}
+
+function runSendBlockedFixture(): { exitCode: number; output: string; handoffCount: number } {
+  const resultName = "local-safety-send-blocked.json";
+  const resultPath = resolve(harnessRoot, "test-results", resultName);
+  const result = Bun.spawnSync(["bun", "scripts/demo-send-drafts"], {
+    cwd: harnessRoot,
+    env: {
+      ...process.env,
+      TELEGRAM_BOT_TOKEN: "local-test-token",
+      TELEGRAM_CHAT_ID: "12345",
+      PRODUCT_NAME: "Local Safety Product",
+      OPERATOR_NAME: "Local Operator",
+      TARGET_AUDIENCE: "Local fixture audience",
+      PRODUCT_SPEC_PATH: unresolvedProductPath.replace(resolve(harnessRoot, "..") + "/", ""),
+      DEMO_INPUT_PATH: "test-results/local-safety-demo-input.json",
+      DEMO_SEND_RESULT_PATH: `test-results/${resultName}`,
+      DEMO_EXPECTED_MINE_DATE: "2026-05-16",
+      DRY_RUN: "1",
+      KILL_SWITCH: "0",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const output = `${result.stdout.toString()}${result.stderr.toString()}`;
+  const artifact = existsSync(resultPath)
+    ? JSON.parse(readFileSync(resultPath, "utf8")) as { handoff?: unknown[] }
+    : {};
+
+  return {
+    exitCode: result.exitCode,
+    output,
+    handoffCount: artifact.handoff?.length ?? 0,
+  };
+}
+
+function runSendUnsafeContentFixture(): { exitCode: number; output: string; artifactText: string } {
+  const resultName = "local-safety-send-unsafe-content.json";
+  const resultPath = resolve(harnessRoot, "test-results", resultName);
+  const result = Bun.spawnSync(["bun", "scripts/demo-send-drafts"], {
+    cwd: harnessRoot,
+    env: {
+      ...process.env,
+      TELEGRAM_BOT_TOKEN: "local-test-token",
+      TELEGRAM_CHAT_ID: "12345",
+      PRODUCT_NAME: "Local Safety Product",
+      OPERATOR_NAME: "Local Operator",
+      TARGET_AUDIENCE: "Local fixture audience",
+      PRODUCT_SPEC_PATH: resolvedProductPath.replace(resolve(harnessRoot, "..") + "/", ""),
+      DEMO_INPUT_PATH: "test-results/local-safety-demo-input-unsafe.json",
+      DEMO_SEND_RESULT_PATH: `test-results/${resultName}`,
+      DEMO_EXPECTED_MINE_DATE: "2026-05-16",
+      DRY_RUN: "1",
+      KILL_SWITCH: "0",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  return {
+    exitCode: result.exitCode,
+    output: `${result.stdout.toString()}${result.stderr.toString()}`,
+    artifactText: existsSync(resultPath) ? readFileSync(resultPath, "utf8") : "",
+  };
+}
+
+
+type ProofFixture = {
+  sendDraftId: string;
+  evidenceDraftId: string;
+  event: "dry_run_post" | "grace_cancelled";
+  postRoutedTo?: string;
+  scoutRoutedTo?: string;
+  livePublishAttempted?: boolean;
+  autoDmAttempted?: boolean;
+  sendCheckedAt?: string;
+  evidenceCheckedAt?: string;
+};
+
+function writeProofFixture(fixture: ProofFixture): void {
+  const sendCheckedAt = fixture.sendCheckedAt ?? "2026-05-17T00:01:00.000Z";
+  const evidenceCheckedAt = fixture.evidenceCheckedAt ?? "2026-05-17T00:02:00.000Z";
+  const events = [
+    {
+      at: evidenceCheckedAt,
+      event: "grace_period_started",
+      draftId: fixture.evidenceDraftId,
+      lane: "personal",
+      dryRun: true,
+      livePublishAttempted: fixture.livePublishAttempted ?? false,
+      autoDmAttempted: fixture.autoDmAttempted ?? false,
+    },
+    ...(fixture.event === "grace_cancelled"
+      ? [{
+        at: evidenceCheckedAt,
+        event: "stop_requested",
+        draftId: fixture.evidenceDraftId,
+        lane: "personal",
+        dryRun: true,
+        livePublishAttempted: fixture.livePublishAttempted ?? false,
+        autoDmAttempted: fixture.autoDmAttempted ?? false,
+      }]
+      : []),
+    {
+      at: evidenceCheckedAt,
+      event: fixture.event,
+      draftId: fixture.evidenceDraftId,
+      lane: "personal",
+      dryRun: true,
+      livePublishAttempted: fixture.livePublishAttempted ?? false,
+      autoDmAttempted: fixture.autoDmAttempted ?? false,
+    },
+  ];
+  writeFileSync(proofSendPath, `${JSON.stringify({
+    status: "sent",
+    checkedAt: sendCheckedAt,
+    dryRun: true,
+    drafts: [
+      { id: fixture.sendDraftId, lane: "personal", routedTo: fixture.postRoutedTo ?? "Telegram approval inbox" },
+      { id: "proof-scout", lane: "scout-lead", routedTo: fixture.scoutRoutedTo ?? "Telegram manual DM review" },
+    ],
+  }, null, 2)}\n`);
+  writeFileSync(proofEvidencePath, `${JSON.stringify({
+    status: "recorded",
+    events,
+  }, null, 2)}\n`);
+}
+
+type ProofArtifact = {
+  status?: string;
+  completionMode?: string;
+  safetyEvidence?: {
+    approvalCallbackRecorded?: boolean;
+    currentApprovalEvidenceRecorded?: boolean;
+    stopGraceWindowOffered?: boolean;
+    stopCallbackRecorded?: boolean;
+    stopCancellationRecorded?: boolean;
+    dryRunWouldPostRecorded?: boolean;
+    scoutDraftRecorded?: boolean;
+    scoutManualOnlyRoute?: boolean;
+    scoutAutoDmAttempted?: boolean;
+  };
+};
+
+function runProofFixture(fixture: ProofFixture, resultName: string): { exitCode: number; output: string; artifact: ProofArtifact } {
+  writeProofFixture(fixture);
+  const resultPath = resolve(harnessRoot, "test-results", resultName);
+  const result = Bun.spawnSync(["bun", "scripts/demo-approval-proof"], {
+    cwd: harnessRoot,
+    env: {
+      ...process.env,
+      DEMO_SEND_RESULT_PATH: "test-results/local-safety-proof-send.json",
+      DEMO_APPROVAL_EVIDENCE_PATH: "test-results/local-safety-proof-evidence.json",
+      DEMO_PROOF_RESULT_PATH: `test-results/${resultName}`,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  return {
+    exitCode: result.exitCode,
+    output: `${result.stdout.toString()}${result.stderr.toString()}`,
+    artifact: existsSync(resultPath) ? JSON.parse(readFileSync(resultPath, "utf8")) as ProofArtifact : {},
+  };
+}
+
+function runProofMissingEvidence(resultName: string): { exitCode: number; output: string } {
+  writeProofFixture({
+    sendDraftId: "proof-missing-evidence",
+    evidenceDraftId: "proof-missing-evidence",
+    event: "dry_run_post",
+  });
+  rmSync(proofEvidencePath, { force: true });
+  const result = Bun.spawnSync(["bun", "scripts/demo-approval-proof"], {
+    cwd: harnessRoot,
+    env: {
+      ...process.env,
+      DEMO_SEND_RESULT_PATH: "test-results/local-safety-proof-send.json",
+      DEMO_APPROVAL_EVIDENCE_PATH: "test-results/local-safety-proof-evidence.json",
+      DEMO_PROOF_RESULT_PATH: `test-results/${resultName}`,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  return {
+    exitCode: result.exitCode,
+    output: `${result.stdout.toString()}${result.stderr.toString()}`,
+  };
+}
+
+function writeJson(path: string, value: unknown): void {
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function runStatusFixture(kind: "current" | "stale" | "mismatch" | "send-blocked" | "send-incomplete" | "send-failed" | "verifier-fail" | "safety-fail"): { exitCode: number; output: string; status?: string; nextCommand?: string } {
+  const prefix = `test-results/local-safety-status-${kind}`;
+  const readinessPath = resolve(harnessRoot, `${prefix}-readiness.json`);
+  const sendPath = resolve(harnessRoot, `${prefix}-send.json`);
+  const proofPath = resolve(harnessRoot, `${prefix}-proof.json`);
+  const verifierPath = resolve(harnessRoot, `${prefix}-verifier.json`);
+  const safetyPath = resolve(harnessRoot, `${prefix}-safety.json`);
+  const resultPath = resolve(harnessRoot, `${prefix}-result.json`);
+
+  writeJson(readinessPath, { status: "ready", checkedAt: "2026-05-17T00:00:00.000Z" });
+  writeJson(sendPath, {
+    status: kind === "send-blocked" ? "blocked" : kind === "send-failed" ? "failed" : kind === "send-incomplete" ? "sending" : "sent",
+    checkedAt: "2026-05-17T00:01:00.000Z",
+    drafts: [
+      { id: "status-post", lane: "personal" },
+      { id: "status-scout", lane: "scout-lead" },
+    ],
+    missingOrInvalid: kind === "send-blocked"
+      ? ["post draft failed content filter", "contains email"]
+      : kind === "send-failed"
+        ? ["Telegram draft send failed; check TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, network access, and bot permissions."]
+        : [],
+  });
+  writeJson(proofPath, {
+    status: "pass",
+    checkedAt: kind === "stale" ? "2026-05-17T00:00:30.000Z" : "2026-05-17T00:02:00.000Z",
+    sendDraftIds: kind === "mismatch"
+      ? ["personal:other-post", "scout-lead:status-scout"]
+      : ["personal:status-post", "scout-lead:status-scout"],
+  });
+  writeJson(verifierPath, { status: kind === "verifier-fail" ? "fail" : "pass", checkedAt: "2026-05-17T00:03:00.000Z" });
+  writeJson(safetyPath, { status: kind === "safety-fail" ? "fail" : "pass", checkedAt: "2026-05-17T00:03:00.000Z" });
+
+  const result = Bun.spawnSync(["bun", "scripts/demo-status"], {
+    cwd: harnessRoot,
+    env: {
+      ...process.env,
+      DEMO_STATUS_READINESS_PATH: `${prefix}-readiness.json`,
+      DEMO_STATUS_SEND_PATH: `${prefix}-send.json`,
+      DEMO_STATUS_PROOF_PATH: `${prefix}-proof.json`,
+      DEMO_STATUS_VERIFIER_PATH: `${prefix}-verifier.json`,
+      DEMO_STATUS_SAFETY_PATH: `${prefix}-safety.json`,
+      DEMO_STATUS_RESULT_PATH: `${prefix}-result.json`,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const output = `${result.stdout.toString()}${result.stderr.toString()}`;
+  const artifact = existsSync(resultPath)
+    ? JSON.parse(readFileSync(resultPath, "utf8")) as { status?: string; nextCommand?: string }
+    : {};
+
+  return { exitCode: result.exitCode, output, status: artifact.status, nextCommand: artifact.nextCommand };
+}
+
+const { handleCallback, registerDraft } = await import("../telegram/bot.ts");
+const { publishX } = await import("../publish/x-post.ts");
+
+mkdirSync(dirname(localDemoInputPath), { recursive: true });
+writeFileSync(localDemoInputPath, readinessFixtureInput());
+writeFileSync(unsafeDemoInputPath, unsafeContentFixtureInput());
+writeFileSync(logProductPath, productSpec(false));
+writeFileSync(unresolvedProductPath, productSpec(true));
+writeFileSync(resolvedProductPath, productSpec(false));
+
+const dryRunBot = new FakeBot();
+registerDraft(draft("demo-post1", "personal", "Local safety demo draft for dry-run publish guard."));
+await handleCallback(dryRunBot as unknown as TelegramBot, callback("approve:demo-post1"));
+await waitForGraceWindow();
+await handleCallback(dryRunBot as unknown as TelegramBot, callback("stop:demo-post1"));
+
+const stopBot = new FakeBot();
+registerDraft(draft("demo-post2", "personal", "Local safety demo draft for STOP grace window."));
+await handleCallback(stopBot as unknown as TelegramBot, callback("approve:demo-post2"));
+await handleCallback(stopBot as unknown as TelegramBot, callback("stop:demo-post2"));
+await waitForGraceWindow();
+
+const scoutBot = new FakeBot();
+registerDraft(draft("demo-scout1", "scout-lead", "@demo (fit 8/10) - local safety test\n\n---\n\nManual DM draft only."));
+await handleCallback(scoutBot as unknown as TelegramBot, callback("approve:demo-scout1"));
+
+const capBot = new FakeBot();
+const previousDailyCap = process.env.DAILY_POST_CAP;
+process.env.DAILY_POST_CAP = "0";
+registerDraft(draft("demo-cap1", "personal", "Local safety demo draft for daily cap blocking."));
+await handleCallback(capBot as unknown as TelegramBot, callback("approve:demo-cap1"));
+process.env.DAILY_POST_CAP = previousDailyCap ?? "10";
+
+const filterBot = new FakeBot();
+registerDraft(draft("demo-filter1", "personal", "Blocked local filter demo: contact test@example.com for details."));
+await handleCallback(filterBot as unknown as TelegramBot, callback("approve:demo-filter1"));
+
+let publishGuardBlocked = false;
+try {
+  await publishX("This should never reach X in DRY_RUN.");
+} catch (error) {
+  publishGuardBlocked = String((error as Error).message).includes("DRY_RUN=1");
+}
+
+const checks = [
+  {
+    name: "personal draft exposes Post approval button",
+    status: JSON.stringify(draftMessagePayload(draft("demo-post-ui", "personal", "Local UI test.")).reply_markup)
+      .includes("approve:demo-post-ui")
+      ? "pass"
+      : "fail",
+  },
+  {
+    name: "Scout draft has no approve button",
+    status: !JSON.stringify(draftMessagePayload(draft("demo-scout-ui", "scout-lead", "Local Scout UI test.")).reply_markup)
+      .includes("approve:demo-scout-ui")
+      ? "pass"
+      : "fail",
+  },
+  {
+    name: "approval dry-run branch",
+    status: dryRunBot.answers.some((text) => text.includes("Approved")) &&
+      dryRunBot.messages.some((message) => message.hasStopButton) &&
+      dryRunBot.messages.some((message) => message.text.includes("[DRY] Would have posted"))
+      ? "pass"
+      : "fail",
+  },
+  {
+    name: "late STOP after dry-run completion is ignored",
+    status: dryRunBot.answers.some((text) => text.includes("Draft not found")) &&
+      dryRunBot.messages.every((message) => !message.text.includes("Cancelled draft demo-post1"))
+      ? "pass"
+      : "fail",
+  },
+  {
+    name: "STOP grace cancellation",
+    status: stopBot.answers.some((text) => text.includes("Approved")) &&
+      stopBot.answers.some((text) => text.includes("STOPPED")) &&
+      stopBot.messages.some((message) => message.text.includes("Cancelled before publish"))
+      ? "pass"
+      : "fail",
+  },
+  {
+    name: "Scout DM approve blocked",
+    status: scoutBot.answers.some((text) => text.includes("Scout DMs are manual-only")) &&
+      scoutBot.messages.every((message) => !message.text.includes("[DRY] Would have posted"))
+      ? "pass"
+      : "fail",
+  },
+  {
+    name: "daily cap blocks before grace",
+    status: capBot.answers.some((text) => text.includes("daily cap reached")) &&
+      capBot.messages.every((message) => !message.hasStopButton) &&
+      capBot.messages.every((message) => !message.text.includes("[DRY] Would have posted"))
+      ? "pass"
+      : "fail",
+  },
+  {
+    name: "content filter blocks before grace",
+    status: filterBot.answers.some((text) => text.includes("contains email")) &&
+      filterBot.messages.every((message) => !message.hasStopButton) &&
+      filterBot.messages.every((message) => !message.text.includes("[DRY] Would have posted"))
+      ? "pass"
+      : "fail",
+  },
+  {
+    name: "spec execution log redacts draft body",
+    status: readFileSync(logProductPath, "utf8").includes("[dry-run-post] personal draft demo-post1") &&
+      !readFileSync(logProductPath, "utf8").includes("Local safety demo draft for dry-run publish guard")
+      ? "pass"
+      : "fail",
+  },
+  {
+    name: "publishX DRY_RUN guard",
+    status: publishGuardBlocked ? "pass" : "fail",
+  },
+];
+
+const blockedReadiness = runReadinessFixture(unresolvedProductPath, "local-safety-readiness-blocked.json");
+const readyReadiness = runReadinessFixture(resolvedProductPath, "local-safety-readiness-ready.json");
+const blockedSend = runSendBlockedFixture();
+const unsafeContentSend = runSendUnsafeContentFixture();
+const currentProof = runProofFixture({
+  sendDraftId: "proof-current",
+  evidenceDraftId: "proof-current",
+  event: "dry_run_post",
+}, "local-safety-proof-current.json");
+const stoppedProof = runProofFixture({
+  sendDraftId: "proof-stopped",
+  evidenceDraftId: "proof-stopped",
+  event: "grace_cancelled",
+}, "local-safety-proof-stopped.json");
+const staleProof = runProofFixture({
+  sendDraftId: "proof-current",
+  evidenceDraftId: "proof-stale",
+  event: "dry_run_post",
+}, "local-safety-proof-stale.json");
+const oldSameDraftProof = runProofFixture({
+  sendDraftId: "proof-current",
+  evidenceDraftId: "proof-current",
+  event: "dry_run_post",
+  sendCheckedAt: "2026-05-17T00:03:00.000Z",
+  evidenceCheckedAt: "2026-05-17T00:02:00.000Z",
+}, "local-safety-proof-old-same-draft.json");
+const wrongRouteProof = runProofFixture({
+  sendDraftId: "proof-current",
+  evidenceDraftId: "proof-current",
+  event: "dry_run_post",
+  scoutRoutedTo: "Telegram approval inbox",
+}, "local-safety-proof-wrong-route.json");
+const missingEvidenceProof = runProofMissingEvidence("local-safety-proof-missing-evidence.json");
+const liveAttemptProof = runProofFixture({
+  sendDraftId: "proof-current",
+  evidenceDraftId: "proof-current",
+  event: "dry_run_post",
+  livePublishAttempted: true,
+}, "local-safety-proof-live-attempt.json");
+const autoDmAttemptProof = runProofFixture({
+  sendDraftId: "proof-current",
+  evidenceDraftId: "proof-current",
+  event: "dry_run_post",
+  autoDmAttempted: true,
+}, "local-safety-proof-auto-dm-attempt.json");
+const currentStatus = runStatusFixture("current");
+const staleStatus = runStatusFixture("stale");
+const mismatchStatus = runStatusFixture("mismatch");
+const sendBlockedStatus = runStatusFixture("send-blocked");
+const sendIncompleteStatus = runStatusFixture("send-incomplete");
+const sendFailedStatus = runStatusFixture("send-failed");
+const verifierFailStatus = runStatusFixture("verifier-fail");
+const safetyFailStatus = runStatusFixture("safety-fail");
+checks.push({
+  name: "readiness blocks unresolved product handoff",
+  status: blockedReadiness.exitCode !== 0 && blockedReadiness.output.includes("Product brief") ? "pass" : "fail",
+});
+checks.push({
+  name: "readiness accepts resolved product handoff",
+  status: readyReadiness.exitCode === 0 ? "pass" : "fail",
+});
+checks.push({
+  name: "send blocks unresolved product handoff with handoff artifact",
+  status: blockedSend.exitCode !== 0 &&
+    blockedSend.output.includes("Product brief") &&
+    blockedSend.output.includes("handoff:") &&
+    blockedSend.handoffCount > 0
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "send blocks unsafe content before Telegram routing",
+  status: unsafeContentSend.exitCode !== 0 &&
+    unsafeContentSend.output.includes("post draft failed content filter") &&
+    unsafeContentSend.output.includes("contains email") &&
+    !unsafeContentSend.artifactText.includes("test@example.com") &&
+    !unsafeContentSend.artifactText.includes("Unsafe local fixture contact")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "approval proof accepts current dry-run evidence",
+  status: currentProof.exitCode === 0 &&
+    currentProof.output.includes("PASS approval proof") &&
+    currentProof.artifact.completionMode === "dry-run-would-post" &&
+    currentProof.artifact.safetyEvidence?.approvalCallbackRecorded === true &&
+    currentProof.artifact.safetyEvidence?.currentApprovalEvidenceRecorded === true &&
+    currentProof.artifact.safetyEvidence?.stopGraceWindowOffered === true &&
+    currentProof.artifact.safetyEvidence?.dryRunWouldPostRecorded === true &&
+    currentProof.artifact.safetyEvidence?.scoutDraftRecorded === true &&
+    currentProof.artifact.safetyEvidence?.scoutManualOnlyRoute === true &&
+    currentProof.artifact.safetyEvidence?.scoutAutoDmAttempted === false
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "approval proof records STOP cancellation mode",
+  status: stoppedProof.exitCode === 0 &&
+    stoppedProof.artifact.completionMode === "stop-cancelled" &&
+    stoppedProof.artifact.safetyEvidence?.stopGraceWindowOffered === true &&
+    stoppedProof.artifact.safetyEvidence?.stopCallbackRecorded === true &&
+    stoppedProof.artifact.safetyEvidence?.stopCancellationRecorded === true &&
+    stoppedProof.artifact.safetyEvidence?.dryRunWouldPostRecorded === false
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "approval proof rejects stale evidence",
+  status: staleProof.exitCode !== 0 && staleProof.output.includes("current post draft evidence missing grace_period_started") ? "pass" : "fail",
+});
+checks.push({
+  name: "approval proof rejects old evidence with repeated draft id",
+  status: oldSameDraftProof.exitCode !== 0 &&
+    oldSameDraftProof.output.includes("approval evidence events are older than current sent draft artifact")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "approval proof rejects wrong Scout route",
+  status: wrongRouteProof.exitCode !== 0 && wrongRouteProof.output.includes("Scout draft must route to Telegram manual DM review") ? "pass" : "fail",
+});
+checks.push({
+  name: "approval proof rejects missing approval evidence",
+  status: missingEvidenceProof.exitCode !== 0 &&
+    missingEvidenceProof.output.includes("telegram-approval-evidence.json is missing or invalid")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "approval proof rejects live publish attempt evidence",
+  status: liveAttemptProof.exitCode !== 0 &&
+    liveAttemptProof.output.includes("approval evidence has livePublishAttempted=true")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "approval proof rejects auto-DM attempt evidence",
+  status: autoDmAttemptProof.exitCode !== 0 &&
+    autoDmAttemptProof.output.includes("approval evidence has autoDmAttempted=true")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "status accepts current proof artifact",
+  status: currentStatus.exitCode === 0 && currentStatus.status === "pass" ? "pass" : "fail",
+});
+checks.push({
+  name: "status rejects stale proof artifact",
+  status: staleStatus.exitCode !== 0 &&
+    staleStatus.status === "awaiting-proof" &&
+    staleStatus.output.includes("demo proof is older")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "status rejects mismatched proof artifact",
+  status: mismatchStatus.exitCode !== 0 &&
+    mismatchStatus.status === "awaiting-proof" &&
+    mismatchStatus.output.includes("demo proof does not match current sent draft ids")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "status rejects blocked send artifact after readiness",
+  status: sendBlockedStatus.exitCode !== 0 &&
+    sendBlockedStatus.status === "send-blocked" &&
+    sendBlockedStatus.nextCommand === "bun run demo:send" &&
+    sendBlockedStatus.output.includes("post draft failed content filter")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "status rejects incomplete send artifact",
+  status: sendIncompleteStatus.exitCode !== 0 &&
+    sendIncompleteStatus.status === "send-incomplete" &&
+    sendIncompleteStatus.nextCommand === "bun run demo:send" &&
+    sendIncompleteStatus.output.includes("demo send did not finish")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "status rejects failed send artifact",
+  status: sendFailedStatus.exitCode !== 0 &&
+    sendFailedStatus.status === "send-failed" &&
+    sendFailedStatus.nextCommand === "bun run demo:send" &&
+    sendFailedStatus.output.includes("Telegram draft send failed")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "status rejects failed verifier artifact",
+  status: verifierFailStatus.exitCode !== 0 &&
+    verifierFailStatus.status === "awaiting-verification" &&
+    verifierFailStatus.nextCommand === "bun scripts/verify-harness" &&
+    verifierFailStatus.output.includes("harness verifier must pass")
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "status rejects failed safety artifact",
+  status: safetyFailStatus.exitCode !== 0 &&
+    safetyFailStatus.status === "awaiting-verification" &&
+    safetyFailStatus.nextCommand === "bun run demo:safety" &&
+    safetyFailStatus.output.includes("demo safety check must pass")
+    ? "pass"
+    : "fail",
+});
+
+const approvalEvidence = JSON.parse(readFileSync(approvalEvidencePath, "utf8")) as { events: Array<{ event: string; livePublishAttempted: boolean; autoDmAttempted: boolean }> };
+const evidenceEvents = new Set(approvalEvidence.events.map((event) => event.event));
+const lateStopWasRecorded = approvalEvidence.events
+  .some((event) => event.event === "stop_requested" && (event as { draftId?: string }).draftId === "demo-post1");
+const botSource = readFileSync(resolve(harnessRoot, "telegram/bot.ts"), "utf8");
+checks.push({
+  name: "redacted approval evidence",
+  status: evidenceEvents.has("grace_period_started") &&
+    evidenceEvents.has("dry_run_post") &&
+    evidenceEvents.has("stop_requested") &&
+    evidenceEvents.has("grace_cancelled") &&
+    evidenceEvents.has("scout_dm_approve_blocked") &&
+    evidenceEvents.has("publish_blocked_pre_publish") &&
+    evidenceEvents.has("publish_blocked_content_filter") &&
+    !lateStopWasRecorded &&
+    approvalEvidence.events.every((event) => event.autoDmAttempted === false) &&
+    approvalEvidence.events.filter((event) => event.event !== "live_posted" && event.event !== "live_publish_failed").every((event) => event.livePublishAttempted === false)
+    ? "pass"
+    : "fail",
+});
+checks.push({
+  name: "bot terminal errors are redacted",
+  status: botSource.includes("details redacted") &&
+    botSource.includes("polling_error") &&
+    !botSource.includes("console.error(e)") &&
+    !botSource.includes("(e as Error).message")
+    ? "pass"
+    : "fail",
+});
+
+const status = checks.every((check) => check.status === "pass") ? "pass" : "fail";
+const result = {
+  status,
+  checkedAt: new Date().toISOString(),
+  harnessRoot,
+  checks,
+  safetyEvidence: {
+    fakeTelegramOnly: true,
+    externalApisCalled: false,
+    livePublishAttempted: false,
+    autoDmAttempted: false,
+    secretValuesPrinted: false,
+  },
+};
+
+mkdirSync(dirname(resultPath), { recursive: true });
+writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+
+for (const check of checks) {
+  console.log(`${check.status === "pass" ? "PASS" : "FAIL"} ${check.name}`);
+}
+console.log(`\nresult: ${status}`);
+console.log("wrote: test-results/demo-local-safety.json");
+
+if (status !== "pass") process.exit(1);

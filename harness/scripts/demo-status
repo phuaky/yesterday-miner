@@ -1,0 +1,193 @@
+#!/usr/bin/env bun
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+
+type ResultFile = {
+  status?: string;
+  stage?: string;
+  checkedAt?: string;
+  drafts?: Array<{ id: string; lane: string }>;
+  sendDraftIds?: string[];
+  missingOrInvalid?: string[];
+  details?: string[];
+  handoff?: HandoffItem[];
+};
+
+type HandoffItem = {
+  path: string;
+  input: string;
+  requiredFormat: string;
+  notes?: string;
+};
+
+const harnessRoot = resolve(import.meta.dir, "..");
+const resultPath = resolve(harnessRoot, process.env.DEMO_STATUS_RESULT_PATH?.trim() || "test-results/demo-status.json");
+
+function readResult(path: string): ResultFile | null {
+  const full = resolve(harnessRoot, path);
+  if (!existsSync(full)) return null;
+  try {
+    return JSON.parse(readFileSync(full, "utf8")) as ResultFile;
+  } catch {
+    return { status: "invalid", details: [`${path} is invalid JSON`] };
+  }
+}
+
+function stagePath(envName: string, defaultPath: string): string {
+  return process.env[envName]?.trim() || defaultPath;
+}
+
+const stages = {
+  readiness: readResult(stagePath("DEMO_STATUS_READINESS_PATH", "test-results/demo-readiness.json")),
+  send: readResult(stagePath("DEMO_STATUS_SEND_PATH", "test-results/demo-send-drafts.json")),
+  proof: readResult(stagePath("DEMO_STATUS_PROOF_PATH", "test-results/demo-approval-proof.json")),
+  operator: readResult(stagePath("DEMO_STATUS_OPERATOR_PATH", "test-results/demo-operator.json")),
+  verifier: readResult(stagePath("DEMO_STATUS_VERIFIER_PATH", "test-results/.last-run.json")),
+  safety: readResult(stagePath("DEMO_STATUS_SAFETY_PATH", "test-results/demo-local-safety.json")),
+};
+
+function isCurrentAfter(newer: ResultFile | null, older: ResultFile | null): boolean {
+  if (!newer?.checkedAt || !older?.checkedAt) return false;
+  const newerTime = Date.parse(newer.checkedAt);
+  const olderTime = Date.parse(older.checkedAt);
+  return Number.isFinite(newerTime) && Number.isFinite(olderTime) && newerTime >= olderTime;
+}
+
+function proofIsCurrent(): boolean {
+  return proofIsFresh() && proofMatchesSend();
+}
+
+function proofIsFresh(): boolean {
+  return stages.proof?.status === "pass" &&
+    stages.send?.status === "sent" &&
+    isCurrentAfter(stages.proof, stages.send);
+}
+
+function draftIdsFor(stage: ResultFile | null): string[] {
+  return (stage?.drafts ?? [])
+    .filter((draft) => draft.id && draft.lane)
+    .map((draft) => `${draft.lane}:${draft.id}`)
+    .sort();
+}
+
+function proofMatchesSend(): boolean {
+  const currentSendDraftIds = draftIdsFor(stages.send);
+  const proofDraftIds = [...(stages.proof?.sendDraftIds ?? [])].sort();
+  return currentSendDraftIds.length > 0 &&
+    currentSendDraftIds.length === proofDraftIds.length &&
+    currentSendDraftIds.every((id, index) => id === proofDraftIds[index]);
+}
+
+function overallStatus(): string {
+  if (
+    stages.readiness?.status === "ready" &&
+    stages.send?.status === "sent" &&
+    proofIsCurrent() &&
+    stages.verifier?.status === "pass" &&
+    stages.safety?.status === "pass"
+  ) return "pass";
+  if (stages.readiness?.status === "ready" && stages.send?.status === "blocked") return "send-blocked";
+  if (stages.send?.status === "failed") return "send-failed";
+  if (stages.send?.status === "sending") return "send-incomplete";
+  if (stages.send?.status === "sent" && !proofIsCurrent()) return "awaiting-proof";
+  if (stages.send?.status === "sent") return "awaiting-verification";
+  if (stages.readiness?.status === "ready") return "ready-to-send";
+  return "blocked";
+}
+
+function nextCommandFor(status: string): string {
+  if (status === "blocked") return "bun run demo:ready";
+  if (status === "ready-to-send") return "bun run demo:operator";
+  if (status === "send-blocked") return "bun run demo:send";
+  if (status === "send-incomplete") return "bun run demo:send";
+  if (status === "send-failed") return "bun run demo:send";
+  if (status === "awaiting-proof") return "bun run demo:proof";
+  if (status === "awaiting-verification") {
+    if (stages.verifier?.status !== "pass") return "bun scripts/verify-harness";
+    if (stages.safety?.status !== "pass") return "bun run demo:safety";
+    return "bun run demo:status";
+  }
+  return "none";
+}
+
+function normalizeRemaining(item: string): string | null {
+  if (/ exited \d+$/.test(item)) return null;
+  return item
+    .replace(/^harness\/\.env missing or invalid /, "harness/.env missing real ")
+    .replace(/^demo\/demo-input\.json needs real /, "demo input needs real ")
+    .replace(/^demo\/demo-input\.json /, "demo input ");
+}
+
+const readinessIsReady = stages.readiness?.status === "ready";
+const sendIsCurrentEnough = readinessIsReady || stages.send?.status === "sent";
+
+const remaining = [
+  ...(stages.readiness?.missingOrInvalid ?? []),
+  ...(sendIsCurrentEnough && stages.send?.status === "blocked" ? stages.send.missingOrInvalid ?? [] : []),
+  ...(stages.send?.status === "sending" ? ["demo send did not finish; rerun bun run demo:send"] : []),
+  ...(stages.send?.status === "failed" ? stages.send.missingOrInvalid ?? ["Telegram draft send failed; rerun bun run demo:send"] : []),
+  ...(readinessIsReady && stages.operator?.status === "blocked" ? stages.operator.details ?? [] : []),
+  ...(stages.proof?.status === "pass" && stages.send?.status === "sent" && !proofIsFresh()
+    ? ["demo proof is older than the sent draft artifact; rerun bun run demo:proof"]
+    : []),
+  ...(stages.proof?.status === "pass" && stages.send?.status === "sent" && proofIsFresh() && !proofMatchesSend()
+    ? ["demo proof does not match current sent draft ids; rerun bun run demo:proof"]
+    : []),
+  ...(stages.send?.status === "sent" && proofIsCurrent() && stages.verifier?.status !== "pass" ? ["harness verifier must pass"] : []),
+  ...(stages.send?.status === "sent" && proofIsCurrent() && stages.safety?.status !== "pass" ? ["demo safety check must pass"] : []),
+]
+  .map(normalizeRemaining)
+  .filter((item): item is string => Boolean(item))
+  .filter((item, index, all) => all.indexOf(item) === index);
+
+const handoffStages = [
+  stages.readiness,
+  ...(sendIsCurrentEnough ? [stages.send] : []),
+  ...(readinessIsReady ? [stages.operator] : []),
+];
+
+const handoff = handoffStages
+  .flatMap((stage) => stage?.handoff ?? [])
+  .filter((item, index, all) =>
+    all.findIndex((candidate) =>
+      candidate.path === item.path &&
+      candidate.input === item.input &&
+      candidate.requiredFormat === item.requiredFormat
+    ) === index
+  );
+
+const status = overallStatus();
+const result = {
+  status,
+  checkedAt: new Date().toISOString(),
+  harnessRoot,
+  stages: Object.fromEntries(Object.entries(stages).map(([name, value]) => [
+    name,
+    value ? { status: value.status, stage: value.stage } : { status: "missing" },
+  ])),
+  remaining,
+  handoff,
+  nextCommand: nextCommandFor(status),
+  safetyEvidence: {
+    secretValuesPrinted: false,
+    privateContentPrinted: false,
+  },
+};
+
+mkdirSync(dirname(resultPath), { recursive: true });
+writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+
+console.log(`demo status: ${result.status}`);
+if (result.remaining.length > 0) {
+  console.log("remaining:");
+  for (const item of result.remaining) console.log(`  - ${item}`);
+}
+if (result.handoff.length > 0) {
+  console.log("handoff:");
+  for (const item of result.handoff) console.log(`  - ${item.path} -> ${item.input}: ${item.requiredFormat}`);
+}
+console.log(`next: ${result.nextCommand}`);
+console.log(`wrote: ${resultPath.replace(`${harnessRoot}/`, "")}`);
+
+if (result.status !== "pass") process.exit(1);

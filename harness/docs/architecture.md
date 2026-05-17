@@ -12,7 +12,7 @@ The public repo contains the harness. Product-specific campaigns belong in ignor
 
 | Convention | Yesterday Miner equivalent | Current status |
 |---|---|---|
-| Current State -> Ideal State | 8-section product spec at `PRODUCT_SPEC_PATH` | Strong |
+| Goal -> Done loop | 8-section product spec at `PRODUCT_SPEC_PATH` | Strong |
 | Work artifact | `product.md` locally, `templates/product.template.md` publicly | Strong |
 | Tool registry | `harness.manifest.json` commands and side effects | Strong |
 | Skills/workflows/tools | Bun modules under `ingest/`, `miner/`, `scout/`, `telegram/`, `publish/`, `parser/` | Explicit modules |

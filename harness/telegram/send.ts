@@ -26,6 +26,13 @@ export type Draft = {
   meta?: Record<string, unknown>;
 };
 
+export type DraftMessagePayload = {
+  text: string;
+  reply_markup: {
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  };
+};
+
 export function draftId(d: Pick<Draft, "lane" | "date" | "body">): string {
   return createHash("sha256")
     .update(`${d.lane}|${d.date}|${d.body}`)
@@ -33,18 +40,23 @@ export function draftId(d: Pick<Draft, "lane" | "date" | "body">): string {
     .slice(0, 10);
 }
 
-export async function sendDraft(draft: Draft): Promise<void> {
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!chatId) throw new Error("TELEGRAM_CHAT_ID missing");
-
-  const tag = draft.lane === "personal" ? "🧠" : draft.lane === "context" ? "🧭" : "🎯";
+export function draftMessagePayload(draft: Draft): DraftMessagePayload {
+  const tag = draft.lane === "personal" ? "[personal]" : draft.lane === "context" ? "[context]" : "[scout]";
   const dryTag = process.env.DRY_RUN === "1" ? " [DRY]" : "";
-  const text = `${tag} *${draft.lane}* — mined from ${draft.date}${dryTag}\n\n${draft.body}`;
-
-  await getBot().sendMessage(chatId, text, {
-    parse_mode: "Markdown",
-    reply_markup: {
-      inline_keyboard: [
+  const scoutTag = draft.lane === "scout-lead" ? " - manual DM only" : "";
+  const text = `${tag} ${draft.lane} - mined from ${draft.date}${dryTag}${scoutTag}\n\n${draft.body}`;
+  const inline_keyboard = draft.lane === "scout-lead"
+    ? [
+        [
+          { text: "✏️ Edit", callback_data: `edit:${draft.id}` },
+          { text: "🔁 Redraft", callback_data: `redraft:${draft.id}` },
+        ],
+        [
+          { text: "✅ Done", callback_data: `skip:${draft.id}` },
+          { text: "❌ Skip", callback_data: `skip:${draft.id}` },
+        ],
+      ]
+    : [
         [
           { text: "✅ Post", callback_data: `approve:${draft.id}` },
           { text: "✏️ Edit", callback_data: `edit:${draft.id}` },
@@ -53,8 +65,18 @@ export async function sendDraft(draft: Draft): Promise<void> {
           { text: "🔁 Redraft", callback_data: `redraft:${draft.id}` },
           { text: "❌ Skip", callback_data: `skip:${draft.id}` },
         ],
-      ],
-    },
+      ];
+
+  return { text, reply_markup: { inline_keyboard } };
+}
+
+export async function sendDraft(draft: Draft): Promise<void> {
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!chatId) throw new Error("TELEGRAM_CHAT_ID missing");
+
+  const payload = draftMessagePayload(draft);
+  await getBot().sendMessage(chatId, payload.text, {
+    reply_markup: payload.reply_markup,
   });
 }
 

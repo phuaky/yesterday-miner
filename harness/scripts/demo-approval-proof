@@ -1,0 +1,142 @@
+#!/usr/bin/env bun
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+
+type ApprovalEvent = {
+  at?: string;
+  event: string;
+  draftId: string;
+  lane?: string;
+  dryRun: boolean;
+  livePublishAttempted: boolean;
+  autoDmAttempted: boolean;
+};
+
+type ApprovalEvidence = {
+  status?: string;
+  events?: ApprovalEvent[];
+};
+
+type SendResult = {
+  status?: string;
+  checkedAt?: string;
+  dryRun?: boolean;
+  drafts?: Array<{ id: string; lane: string; routedTo?: string }>;
+};
+
+const harnessRoot = resolve(import.meta.dir, "..");
+const proofPath = resolve(harnessRoot, process.env.DEMO_PROOF_RESULT_PATH?.trim() || "test-results/demo-approval-proof.json");
+const evidencePath = resolve(harnessRoot, process.env.DEMO_APPROVAL_EVIDENCE_PATH?.trim() || "test-results/telegram-approval-evidence.json");
+const sendPath = resolve(harnessRoot, process.env.DEMO_SEND_RESULT_PATH?.trim() || "test-results/demo-send-drafts.json");
+
+function readJson<T>(path: string): T | null {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as T;
+  } catch {
+    return null;
+  }
+}
+
+const sendResult = readJson<SendResult>(sendPath);
+const evidence = readJson<ApprovalEvidence>(evidencePath);
+const events = evidence?.events ?? [];
+
+const failures: string[] = [];
+const blockers: string[] = [];
+
+if (sendResult?.status !== "sent") blockers.push("demo-send-drafts.json status must be sent");
+if (sendResult?.dryRun !== true) blockers.push("demo-send-drafts.json must record dryRun=true");
+if (!Array.isArray(sendResult?.drafts) || sendResult.drafts.length < 2) blockers.push("demo-send-drafts.json must include both routed drafts");
+const personalDraft = sendResult?.drafts?.find((draft) => draft.lane === "personal" || draft.lane === "context");
+const scoutDraft = sendResult?.drafts?.find((draft) => draft.lane === "scout-lead");
+const scoutManualOnlyRoute = scoutDraft?.routedTo === "Telegram manual DM review";
+if (!personalDraft) blockers.push("demo-send-drafts.json missing routed post draft");
+if (!scoutDraft) blockers.push("demo-send-drafts.json missing routed Scout draft");
+if (personalDraft?.routedTo !== "Telegram approval inbox") blockers.push("demo-send-drafts.json post draft must route to Telegram approval inbox");
+if (!scoutManualOnlyRoute) blockers.push("demo-send-drafts.json Scout draft must route to Telegram manual DM review");
+
+const personalEvents = personalDraft ? events.filter((event) => event.draftId === personalDraft.id) : [];
+function eventIsCurrentForSend(event: ApprovalEvent): boolean {
+  if (!sendResult?.checkedAt || !event.at) return false;
+  const sendTime = Date.parse(sendResult.checkedAt);
+  const eventTime = Date.parse(event.at);
+  return Number.isFinite(sendTime) && Number.isFinite(eventTime) && eventTime >= sendTime;
+}
+
+const currentPersonalEvents = personalEvents.filter(eventIsCurrentForSend);
+const personalEventNames = new Set(currentPersonalEvents.map((event) => event.event));
+const stopWindowOffered = personalEventNames.has("grace_period_started");
+const stopCallbackRecorded = personalEventNames.has("stop_requested");
+const stopCancellationRecorded = personalEventNames.has("grace_cancelled");
+const dryRunWouldPostRecorded = personalEventNames.has("dry_run_post");
+const sendDraftIds = (sendResult?.drafts ?? [])
+  .map((draft) => `${draft.lane}:${draft.id}`)
+  .sort();
+
+if (!evidence) failures.push("telegram-approval-evidence.json is missing or invalid");
+if (personalDraft && personalEvents.length > 0 && currentPersonalEvents.length === 0) failures.push("approval evidence events are older than current sent draft artifact");
+if (personalDraft && !stopWindowOffered) failures.push("current post draft evidence missing grace_period_started");
+if (personalDraft && !dryRunWouldPostRecorded && !stopCancellationRecorded) failures.push("current post draft evidence missing dry_run_post or grace_cancelled");
+if (events.some((event) => event.event === "live_posted")) failures.push("approval evidence contains live_posted during dry-run demo");
+if (events.some((event) => event.livePublishAttempted)) failures.push("approval evidence has livePublishAttempted=true");
+if (events.some((event) => event.autoDmAttempted)) failures.push("approval evidence has autoDmAttempted=true");
+if (events.some((event) => event.dryRun !== true)) failures.push("approval evidence contains a non-dry-run event");
+
+const completionMode = stopCancellationRecorded
+  ? "stop-cancelled"
+  : dryRunWouldPostRecorded
+    ? "dry-run-would-post"
+    : "incomplete";
+
+const status = blockers.length > 0 ? "blocked" : failures.length > 0 ? "fail" : "pass";
+const result = {
+  status,
+  checkedAt: new Date().toISOString(),
+  harnessRoot,
+  evidencePath,
+  sendPath,
+  sendDraftIds,
+  verifiedPostDraftId: personalDraft?.id,
+  verifiedScoutDraftId: scoutDraft?.id,
+  events: events.map((event) => ({
+    at: event.at,
+    event: event.event,
+    draftId: event.draftId,
+    lane: event.lane,
+    dryRun: event.dryRun,
+    livePublishAttempted: event.livePublishAttempted,
+    autoDmAttempted: event.autoDmAttempted,
+  })),
+  missingOrInvalid: [...blockers, ...failures],
+  completionMode,
+  safetyEvidence: {
+    approvalCallbackRecorded: stopWindowOffered,
+    currentApprovalEvidenceRecorded: currentPersonalEvents.length > 0,
+    stopGraceWindowOffered: stopWindowOffered,
+    stopCallbackRecorded,
+    stopCancellationRecorded,
+    dryRunWouldPostRecorded,
+    scoutDraftRecorded: Boolean(scoutDraft),
+    scoutManualOnlyRoute,
+    scoutAutoDmAttempted: false,
+    livePublishAttempted: events.some((event) => event.livePublishAttempted),
+    autoDmAttempted: events.some((event) => event.autoDmAttempted),
+    secretValuesPrinted: false,
+    draftBodiesRecorded: false,
+  },
+};
+
+mkdirSync(dirname(proofPath), { recursive: true });
+writeFileSync(proofPath, `${JSON.stringify(result, null, 2)}\n`);
+
+if (status === "pass") {
+  console.log("PASS approval proof");
+} else {
+  console.log(`${status === "blocked" ? "BLOCKED" : "FAIL"} approval proof`);
+  for (const item of result.missingOrInvalid) console.log(`  - ${item}`);
+}
+console.log(`wrote: ${proofPath.replace(`${harnessRoot}/`, "")}`);
+
+if (status !== "pass") process.exit(1);

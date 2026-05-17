@@ -9,13 +9,15 @@ let client: TwitterApi | null = null;
 
 function getClient(): TwitterApi {
   if (client) return client;
-  const { X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET } = process.env;
-  if (!X_API_KEY || !X_API_SECRET || !X_ACCESS_TOKEN || !X_ACCESS_TOKEN_SECRET) {
-    throw new Error("X_API_KEY/SECRET/ACCESS_TOKEN/ACCESS_TOKEN_SECRET required");
+  const xConsumerKey = process.env.X_CONSUMER_KEY ?? process.env.X_API_KEY;
+  const xConsumerSecret = process.env.X_CONSUMER_SECRET ?? process.env.X_API_SECRET;
+  const { X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET } = process.env;
+  if (!xConsumerKey || !xConsumerSecret || !X_ACCESS_TOKEN || !X_ACCESS_TOKEN_SECRET) {
+    throw new Error("X_CONSUMER_KEY/X_CONSUMER_SECRET/X_ACCESS_TOKEN/X_ACCESS_TOKEN_SECRET required");
   }
   client = new TwitterApi({
-    appKey: X_API_KEY,
-    appSecret: X_API_SECRET,
+    appKey: xConsumerKey,
+    appSecret: xConsumerSecret,
     accessToken: X_ACCESS_TOKEN,
     accessSecret: X_ACCESS_TOKEN_SECRET,
   });
@@ -23,6 +25,9 @@ function getClient(): TwitterApi {
 }
 
 export async function publishX(text: string): Promise<string> {
+  if (process.env.DRY_RUN === "1") {
+    throw new Error("DRY_RUN=1 blocks live X publish");
+  }
   const c = getClient().readWrite;
   const res = await c.v2.tweet(text);
   const handle = process.env.X_HANDLE ?? "your_handle";

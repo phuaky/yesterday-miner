@@ -75,6 +75,20 @@ function gitCheckIgnored(pathFromProjectRoot: string): boolean | null {
   return proc.exitCode === 0;
 }
 
+function duplicates(items: string[]): string[] {
+  const seen = new Set<string>();
+  const out = new Set<string>();
+  for (const item of items) {
+    if (seen.has(item)) out.add(item);
+    seen.add(item);
+  }
+  return [...out];
+}
+
+function missingFrom(expected: string[], actual: Set<string>): string[] {
+  return expected.filter((item) => !actual.has(item));
+}
+
 const requiredFiles = [
   resolve(projectRoot, "templates/product.template.md"),
   resolve(harnessRoot, "README.md"),
@@ -93,7 +107,20 @@ const requiredFiles = [
   resolve(harnessRoot, "docs/architecture.md"),
   resolve(harnessRoot, "docs/state-map.md"),
   resolve(harnessRoot, "docs/events.md"),
-  resolve(harnessRoot, "docs/readiness-gate.md")
+  resolve(harnessRoot, "docs/readiness-gate.md"),
+  resolve(harnessRoot, "docs/operator-dry-run-demo.md"),
+  resolve(harnessRoot, "docs/demo.env.example"),
+  resolve(harnessRoot, "docs/demo-input.example.json"),
+  resolve(harnessRoot, "scripts/demo-approval-proof"),
+  resolve(harnessRoot, "scripts/demo-bootstrap"),
+  resolve(harnessRoot, "scripts/demo-date.ts"),
+  resolve(harnessRoot, "scripts/demo-handoff.ts"),
+  resolve(harnessRoot, "scripts/demo-local-safety"),
+  resolve(harnessRoot, "scripts/demo-operator"),
+  resolve(harnessRoot, "scripts/demo-readiness"),
+  resolve(harnessRoot, "scripts/demo-run"),
+  resolve(harnessRoot, "scripts/demo-send-drafts"),
+  resolve(harnessRoot, "scripts/demo-status")
 ];
 
 const missingFiles = requiredFiles.filter((path) => !existsSync(path)).map(rel);
@@ -109,16 +136,93 @@ const manifest = readJson<Manifest>(manifestPath);
 if (!manifest) {
   add("manifest parses", "fail", "harness.manifest.json is missing or invalid JSON.");
 } else {
-  const commandNames = new Set(manifest.commands.map((c) => c.name));
-  const gateNames = new Set(manifest.safetyGates.map((g) => g.name));
   const requiredCommands = ["ralph", "mine", "scout", "ingest", "voice", "bot", "verify"];
-  const missingCommands = requiredCommands.filter((name) => !commandNames.has(name));
-  const missingGates = ["KILL_SWITCH", "DRY_RUN", "telegram-approval-before-publish", "grace-period-stop", "daily-cap", "manual-dm-only"].filter((name) => !gateNames.has(name));
+  const requiredEnv = [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "APIFY_TOKEN",
+    "X_HANDLE",
+    "X_BEARER_TOKEN",
+    "X_CONSUMER_KEY",
+    "X_CONSUMER_SECRET",
+    "X_ACCESS_TOKEN",
+    "X_ACCESS_TOKEN_SECRET",
+    "DISCORD_USER_TOKEN",
+    "DISCORD_CHANNELS",
+    "OPENAI_API_KEY",
+    "CODEX_MODEL",
+    "PRODUCT_SPEC_PATH",
+    "PRODUCT_NAME",
+    "OPERATOR_NAME",
+    "TARGET_AUDIENCE",
+    "CONTEXT_NAME",
+    "PRODUCT_FIT_RUBRIC",
+    "DRY_RUN",
+    "KILL_SWITCH",
+    "DAILY_POST_CAP",
+    "GRACE_PERIOD_SECONDS"
+  ];
+  const requiredInputs = [
+    "../templates/product.template.md",
+    "../product.md",
+    "../campaigns/**",
+    ".env",
+    "cache/x/{date}.json",
+    "cache/discord/{channel}/{date}.json",
+    "voice/profile.md",
+    "External tracker"
+  ];
+  const requiredOutputs = [
+    "cache/pending-drafts.json",
+    "cache/stop-flags.json",
+    "cache/post-counter.json",
+    "../product.md#6",
+    "test-results/.last-run.json",
+    "Telegram approval inbox",
+    "X post"
+  ];
+  const requiredStateFiles = [
+    ".env",
+    "../product.md",
+    "../campaigns/",
+    "../drafts/",
+    "cache/",
+    "voice/",
+    "voice/profile.md",
+    "voice/corpus.jsonl",
+    "log/",
+    "test-results/.last-run.json"
+  ];
+  const commandNamesList = manifest.commands.map((c) => c.name);
+  const envNamesList = manifest.env.map((e) => e.name);
+  const inputPaths = new Set(manifest.inputs.map((i) => i.path));
+  const outputPaths = new Set(manifest.outputs.map((o) => o.path));
+  const statePaths = new Set(manifest.stateFiles.map((s) => s.path));
+  const gateNamesList = manifest.safetyGates.map((g) => g.name);
+  const commandNames = new Set(commandNamesList);
+  const envNames = new Set(envNamesList);
+  const gateNames = new Set(gateNamesList);
+  const requiredByCommands = new Set(manifest.commands.flatMap((c) => c.safetyRequired ?? []));
+  const manifestMisses = [
+    ...missingFrom(requiredCommands, commandNames).map((c) => `missing command: ${c}`),
+    ...requiredCommands.filter((c) => !manifest.commands.find((cmd) => cmd.name === c)?.command).map((c) => `command ${c} missing command string`),
+    ...missingFrom(requiredEnv, envNames).map((e) => `missing env: ${e}`),
+    ...missingFrom(requiredInputs, inputPaths).map((p) => `missing input: ${p}`),
+    ...missingFrom(requiredOutputs, outputPaths).map((p) => `missing output: ${p}`),
+    ...missingFrom(requiredStateFiles, statePaths).map((p) => `missing state file: ${p}`),
+    ...missingFrom([...requiredByCommands], gateNames).map((g) => `safetyRequired has no gate: ${g}`),
+    ...gateNamesList.filter((g) => !requiredByCommands.has(g)).map((g) => `safety gate is not required by any command: ${g}`),
+    ...duplicates(commandNamesList).map((c) => `duplicate command: ${c}`),
+    ...duplicates(envNamesList).map((e) => `duplicate env: ${e}`),
+    ...duplicates(gateNamesList).map((g) => `duplicate safety gate: ${g}`)
+  ];
+  if (manifest.commands.length !== requiredCommands.length) manifestMisses.push(`expected ${requiredCommands.length} commands, found ${manifest.commands.length}`);
+  if (manifest.env.length !== requiredEnv.length) manifestMisses.push(`expected ${requiredEnv.length} env vars, found ${manifest.env.length}`);
   add(
     "manifest contract",
-    missingCommands.length === 0 && missingGates.length === 0 ? "pass" : "fail",
-    `Manifest declares ${manifest.commands.length} commands, ${manifest.env.length} env vars, and ${manifest.safetyGates.length} safety gates.`,
-    [...missingCommands.map((c) => `missing command: ${c}`), ...missingGates.map((g) => `missing safety gate: ${g}`)]
+    manifestMisses.length === 0 ? "pass" : "fail",
+    `Manifest declares ${manifest.commands.length} commands, ${manifest.env.length} env vars, ${manifest.inputs.length} inputs, ${manifest.outputs.length} outputs, ${manifest.stateFiles.length} state files, and ${manifest.safetyGates.length} safety gates.`,
+    manifestMisses
   );
 
   const exampleKeys = envKeys(resolve(harnessRoot, ".env.example"));
@@ -146,15 +250,40 @@ if (!manifest) {
 try {
   const spec = readSpec(resolve(projectRoot, "templates/product.template.md"));
   const sectionNumbers = [...spec.sections.keys()].sort((a, b) => a - b);
-  const missingSections = [1, 2, 3, 4, 5, 6, 7, 8].filter((n) => !spec.sections.has(n));
+  const expectedSections = new Map<number, string>([
+    [1, "Goal"],
+    [2, "Done"],
+    [3, "Observe"],
+    [4, "Think"],
+    [5, "Plan"],
+    [6, "Execute"],
+    [7, "Verify"],
+    [8, "Reflect-if-passed"]
+  ]);
+  const expectedNumbers = [...expectedSections.keys()];
+  const missingSections = expectedNumbers.filter((n) => !spec.sections.has(n));
+  const unexpectedSections = sectionNumbers.filter((n) => !expectedSections.has(n));
+  const outOfOrder = sectionNumbers.join(",") !== expectedNumbers.join(",");
+  const titleMisses = expectedNumbers.flatMap((n) => {
+    const section = spec.sections.get(n);
+    const expected = expectedSections.get(n);
+    return section && expected && section.title === expected ? [] : [`section ${n} title should be "${expected}"`];
+  });
   const crit = criteria(spec);
   const needs = unfulfilledHumanInputs(spec);
   const tasks = pendingTasks(spec);
+  const specMisses = [
+    ...missingSections.map((n) => `missing section ${n}`),
+    ...unexpectedSections.map((n) => `unexpected section ${n}`),
+    ...(outOfOrder ? [`section order is ${sectionNumbers.join(" -> ")}`] : []),
+    ...titleMisses,
+    ...(crit.length > 0 ? [] : ["section 2 has no checkbox criteria"])
+  ];
   add(
     "spec parses",
-    missingSections.length === 0 && crit.length > 0 ? "pass" : "fail",
-    `Found sections ${sectionNumbers.join(", ")}; ${crit.length} criteria, ${needs.length} open human inputs, ${tasks.length} pending AI tasks.`,
-    missingSections.map((n) => `missing section ${n}`)
+    specMisses.length === 0 ? "pass" : "fail",
+    `Found ordered loop ${expectedNumbers.map((n) => expectedSections.get(n)).join(" -> ")}; ${crit.length} criteria, ${needs.length} open human inputs, ${tasks.length} pending AI tasks.`,
+    specMisses
   );
 } catch (error) {
   add("spec parses", "fail", `Could not parse templates/product.template.md: ${(error as Error).message}`);
@@ -164,7 +293,9 @@ const docsToCheck = [
   { path: resolve(harnessRoot, "README.md"), needles: ["DRY_RUN=1", "KILL_SWITCH=1", "GRACE_PERIOD_SECONDS"] },
   { path: resolve(harnessRoot, "docs/architecture.md"), needles: ["product-agnostic", "Telegram", "DRY_RUN=1"] },
   { path: resolve(harnessRoot, "docs/events.md"), needles: ["draft.approved", "post.dry_run", "KILL_SWITCH=1"] },
-  { path: resolve(harnessRoot, "docs/readiness-gate.md"), needles: ["Tracker columns ready", "Required product links confirmed", "Daily send cap defined"] }
+  { path: resolve(harnessRoot, "docs/readiness-gate.md"), needles: ["Tracker columns ready", "Required product links confirmed", "Daily send cap defined"] },
+  { path: resolve(harnessRoot, "docs/operator-dry-run-demo.md"), needles: ["bun run demo:safety", "bun run demo:send", "bun run demo:proof", "demo/demo-input.json", "DRY_RUN=1"] },
+  { path: resolve(harnessRoot, "docs/demo.env.example"), needles: ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "PRODUCT_NAME", "DRY_RUN=1", "KILL_SWITCH=0"] }
 ];
 const docMisses: string[] = [];
 for (const doc of docsToCheck) {
@@ -189,25 +320,56 @@ for (const file of tsFiles) {
 const allowedPublishLocations = new Set(["publish/x-post.ts", "telegram/bot.ts"]);
 const disallowedPublishLocations = publishCallLocations.filter((file) => !allowedPublishLocations.has(file));
 const botText = readFileSync(resolve(harnessRoot, "telegram/bot.ts"), "utf8");
-const approvalNeedles = [
-  'action === "approve"',
-  "contentFilter(draft.body)",
-  "checkPrePublish()",
-  "gracePeriodSeconds()",
-  "setTimeout",
-  'process.env.DRY_RUN === "1"',
-  "publishX(draft.body)",
-  "recordPublish()"
+const publishText = readFileSync(resolve(harnessRoot, "publish/x-post.ts"), "utf8");
+const approvalOrder = [
+  { name: "approve callback", needle: 'action === "approve"' },
+  { name: "Scout manual-only block", needle: 'draft.lane === "scout-lead"' },
+  { name: "content filter", needle: "contentFilter(draft.body)" },
+  { name: "pre-publish guard", needle: "checkPrePublish()" },
+  { name: "grace timer", needle: "setTimeout" },
+  { name: "dry-run branch", needle: 'if (process.env.DRY_RUN === "1")' },
+  { name: "live publish", needle: "publishX(draft.body)" },
+  { name: "post counter", needle: "recordPublish()" }
 ];
-const missingApprovalNeedles = approvalNeedles.filter((needle) => !botText.includes(needle));
+const approvalPositions = approvalOrder.map((item) => ({ ...item, index: botText.indexOf(item.needle) }));
+const missingApprovalNeedles = approvalPositions.filter((item) => item.index < 0).map((item) => item.name);
+const approvalOrderingFailures = approvalPositions
+  .slice(1)
+  .filter((item, i) => approvalPositions[i]!.index >= 0 && item.index >= 0 && item.index < approvalPositions[i]!.index)
+  .map((item) => `${item.name} appears before ${approvalPositions[approvalPositions.indexOf(item) - 1]?.name ?? "previous gate"}`);
+const stopNeedles = ['action === "stop"', "loadStops()", "stops[id]", "saveStops(stops)"];
+const missingStopNeedles = stopNeedles.filter((needle) => !botText.includes(needle));
+const dryRunPublishGuard = publishText.includes('process.env.DRY_RUN === "1"') && publishText.includes("DRY_RUN=1 blocks live X publish");
 add(
   "publish requires Telegram approval path",
-  disallowedPublishLocations.length === 0 && missingApprovalNeedles.length === 0 ? "pass" : "fail",
+  disallowedPublishLocations.length === 0 && missingApprovalNeedles.length === 0 && approvalOrderingFailures.length === 0 && missingStopNeedles.length === 0 && dryRunPublishGuard ? "pass" : "fail",
   `publishX references found in: ${publishCallLocations.join(", ")}.`,
-  [...disallowedPublishLocations.map((file) => `unexpected publishX reference in ${file}`), ...missingApprovalNeedles.map((needle) => `telegram/bot.ts missing ${needle}`)]
+  [
+    ...disallowedPublishLocations.map((file) => `unexpected publishX reference in ${file}`),
+    ...missingApprovalNeedles.map((gate) => `telegram/bot.ts missing ${gate}`),
+    ...approvalOrderingFailures,
+    ...missingStopNeedles.map((needle) => `STOP grace path missing ${needle}`),
+    ...(dryRunPublishGuard ? [] : ["publish/x-post.ts missing DRY_RUN=1 live-publish guard"])
+  ]
+);
+
+const sendText = readFileSync(resolve(harnessRoot, "telegram/send.ts"), "utf8");
+const dmComposeText = readFileSync(resolve(harnessRoot, "scout/dm-compose.ts"), "utf8");
+const scoutMisses = [
+  ...(botText.includes('draft.lane === "scout-lead"') && botText.includes("Scout DMs are manual-only.") ? [] : ["telegram/bot.ts does not block approve callbacks for scout-lead drafts"]),
+  ...(sendText.includes('draft.lane === "scout-lead"') && sendText.includes("manual DM only") ? [] : ["telegram/send.ts does not render Scout drafts as manual-only"]),
+  ...(dmComposeText.includes("registerDraft(draft)") && dmComposeText.includes("await sendDraft(draft)") ? [] : ["scout/dm-compose.ts does not queue Scout drafts through Telegram"]),
+  ...(dmComposeText.includes("publishX") || dmComposeText.includes("TwitterApi") ? ["scout/dm-compose.ts contains a live X send/publish dependency"] : [])
+];
+add(
+  "scout DMs manual-only",
+  scoutMisses.length === 0 ? "pass" : "fail",
+  "Scout drafts route to Telegram and approve callbacks are blocked from live publish.",
+  scoutMisses
 );
 
 const ignoredPaths = [
+  ".env",
   "AGENTS.md",
   "CLAUDE.md",
   "_TEMPLATE.md",
@@ -219,10 +381,13 @@ const ignoredPaths = [
   "example-referral.md",
   "example-referral/private.md",
   "harness/.env",
-  "harness/cache/.state",
+  "harness/cache/runtime-state.json",
+  "harness/demo/demo-input.json",
+  "harness/test-results/telegram-approval-evidence.json",
   "harness/voice/profile.md",
   "harness/voice/corpus.jsonl",
-  "harness/log/.state",
+  "harness/voice/generated-anchor.md",
+  "harness/log/runtime.log",
   "harness/miner/output/.state",
   "harness/scout/output/.state",
   "harness/test-results/.last-run.json"
@@ -240,10 +405,22 @@ add(
 );
 
 const packageJson = readJson<{ scripts?: Record<string, string> }>(resolve(harnessRoot, "package.json"));
+const packageMisses = [
+  ...(packageJson?.scripts?.verify === "bun scripts/verify-harness" ? [] : ["package script verify should be bun scripts/verify-harness"]),
+  ...(packageJson?.scripts?.["demo:bootstrap"] === "bun scripts/demo-bootstrap" ? [] : ["package script demo:bootstrap should be bun scripts/demo-bootstrap"]),
+  ...(packageJson?.scripts?.["demo:safety"] === "bun scripts/demo-local-safety" ? [] : ["package script demo:safety should be bun scripts/demo-local-safety"]),
+  ...(packageJson?.scripts?.["demo:ready"] === "bun scripts/demo-readiness" ? [] : ["package script demo:ready should be bun scripts/demo-readiness"]),
+  ...(packageJson?.scripts?.["demo:send"] === "bun scripts/demo-send-drafts" ? [] : ["package script demo:send should be bun scripts/demo-send-drafts"]),
+  ...(packageJson?.scripts?.["demo:proof"] === "bun scripts/demo-approval-proof" ? [] : ["package script demo:proof should be bun scripts/demo-approval-proof"]),
+  ...(packageJson?.scripts?.["demo:run"] === "bun scripts/demo-run" ? [] : ["package script demo:run should be bun scripts/demo-run"]),
+  ...(packageJson?.scripts?.["demo:operator"] === "bun scripts/demo-operator" ? [] : ["package script demo:operator should be bun scripts/demo-operator"]),
+  ...(packageJson?.scripts?.["demo:status"] === "bun scripts/demo-status" ? [] : ["package script demo:status should be bun scripts/demo-status"])
+];
 add(
   "verify command",
-  packageJson?.scripts?.verify === "bun scripts/verify-harness" ? "pass" : "fail",
-  packageJson?.scripts?.verify ? `package script verify=${packageJson.scripts.verify}` : "package script verify is missing."
+  packageMisses.length === 0 ? "pass" : "fail",
+  packageJson?.scripts?.verify ? "package scripts expose verify and operator demo checks." : "package scripts are missing.",
+  packageMisses
 );
 
 const status: Status = checks.some((check) => check.status === "fail")

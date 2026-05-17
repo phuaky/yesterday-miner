@@ -1,9 +1,11 @@
 .env
 node_modules/
 cache/
+demo/
+log/
 miner/output/
 scout/output/
-voice/corpus.jsonl
-voice/profile.md
+test-results/.last-run.json
+voice/
 *.log
 .DS_Store

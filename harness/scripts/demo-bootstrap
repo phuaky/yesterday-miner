@@ -1,0 +1,88 @@
+#!/usr/bin/env bun
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { readSpec, unfulfilledHumanInputs } from "../parser/spec.ts";
+
+type NextEdit = {
+  target: string;
+  item: string;
+};
+
+const harnessRoot = resolve(import.meta.dir, "..");
+const projectRoot = resolve(harnessRoot, "..");
+const examplePath = resolve(harnessRoot, "docs/demo-input.example.json");
+const inputPath = resolve(harnessRoot, process.env.DEMO_INPUT_PATH?.trim() || "demo/demo-input.json");
+const envPath = resolve(harnessRoot, ".env");
+const productSpecPath = resolve(projectRoot, process.env.PRODUCT_SPEC_PATH?.trim() || "product.md");
+
+const placeholderValues = new Set([
+  "",
+  "your_product",
+  "Your Name",
+  "your target audience",
+  "your_handle",
+  "<set>",
+]);
+
+function envMap(): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!existsSync(envPath)) return out;
+  for (const raw of readFileSync(envPath, "utf8").split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (match) out.set(match[1]!, match[2]!.trim());
+  }
+  return out;
+}
+
+function missingEnv(keys: string[]): NextEdit[] {
+  const env = envMap();
+  return keys
+    .filter((key) => placeholderValues.has(env.get(key) ?? ""))
+    .map((key) => ({ target: envPath, item: key }));
+}
+
+function productSpecEdits(): NextEdit[] {
+  if (!existsSync(productSpecPath)) {
+    return [{
+      target: productSpecPath,
+      item: "create from /Users/pky/No-AI/templates/product.template.md and fill the 8-section loop",
+    }];
+  }
+
+  try {
+    return unfulfilledHumanInputs(readSpec(productSpecPath))
+      .map((input) => ({ target: productSpecPath, item: `§5 What I need from you -> ${input}` }));
+  } catch {
+    return [{ target: productSpecPath, item: "must parse as the 8-section markdown loop" }];
+  }
+}
+
+let createdInput = false;
+if (!existsSync(inputPath)) {
+  mkdirSync(dirname(inputPath), { recursive: true });
+  writeFileSync(inputPath, readFileSync(examplePath, "utf8"));
+  createdInput = true;
+}
+
+const missing = [
+  ...missingEnv(["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "PRODUCT_NAME", "OPERATOR_NAME", "TARGET_AUDIENCE"]),
+  ...(envMap().get("DRY_RUN") === "1" ? [] : [{ target: envPath, item: "DRY_RUN=1" }]),
+  ...(envMap().get("KILL_SWITCH") === "1" ? [{ target: envPath, item: "KILL_SWITCH=0" }] : []),
+  ...productSpecEdits(),
+];
+
+console.log(createdInput ? `created: ${inputPath}` : `exists: ${inputPath}`);
+console.log("Env template: /Users/pky/No-AI/harness/docs/demo.env.example");
+console.log("Next private edits:");
+if (missing.length === 0) {
+  console.log("  - env keys and product handoff items look ready; fill real values in demo input if still placeholder text");
+} else {
+  for (const edit of missing) console.log(`  - ${edit.target} -> ${edit.item}`);
+}
+console.log(`  - ${inputPath} -> replace placeholder signal/prospect fields`);
+console.log("\nThen run:");
+console.log("  bun run demo:ready");
+console.log("  bun run demo:send");

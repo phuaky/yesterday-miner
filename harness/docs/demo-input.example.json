@@ -1,0 +1,18 @@
+{
+  "mineDate": "2026-05-16",
+  "postSignal": {
+    "text": "<one yesterday signal from X, notes, or cache>",
+    "score": 8,
+    "reason": "<why this is worth drafting into a post>"
+  },
+  "scoutCandidate": {
+    "username": "<prospect_x_username_without_at>",
+    "bio": "<public bio or public context>",
+    "followers": 0,
+    "fitScore": 8,
+    "fitReason": "<why this person is a fit>",
+    "contexts": ["<public context URL or note>"]
+  },
+  "postDraft": "<optional: provide to skip OpenAI composition>",
+  "dmDraft": "<optional: provide to skip OpenAI composition>"
+}

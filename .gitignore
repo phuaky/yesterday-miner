@@ -16,13 +16,13 @@ harness/node_modules/
 # Runtime state and generated data
 cache/
 harness/cache/
+harness/demo/
 log/
 harness/log/
 harness/miner/output/
 harness/scout/output/
 harness/test-results/
-harness/voice/corpus.jsonl
-harness/voice/profile.md
+harness/voice/
 
 # Private product/campaign instances
 AGENTS.md
