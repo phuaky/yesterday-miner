@@ -36,6 +36,12 @@ Think through the product channels, data sources, and outreach/content strategie
 - [ ] Review Telegram drafts.
 - [ ] Run verifier.
 
+**Your parallel work**
+
+- [ ] Provide private product, source, and approval inputs.
+- [ ] Review any Telegram drafts that arrive.
+- [ ] Decide whether to ship, revise, or stop after verification.
+
 ## 6. Execute
 
 <!-- Newest entries first. Runtime appends here only in your private product spec. -->
