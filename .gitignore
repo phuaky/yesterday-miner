@@ -1,0 +1,43 @@
+.DS_Store
+*.log
+
+# Secrets and local runtime config
+.env
+.env.*
+!.env.example
+harness/.env
+harness/.env.*
+!harness/.env.example
+
+# Dependencies
+node_modules/
+harness/node_modules/
+
+# Runtime state and generated data
+cache/
+harness/cache/
+log/
+harness/log/
+harness/miner/output/
+harness/scout/output/
+harness/test-results/
+harness/voice/corpus.jsonl
+harness/voice/profile.md
+
+# Private product/campaign instances
+AGENTS.md
+CLAUDE.md
+_TEMPLATE.md
+product.md
+products/
+campaigns/
+drafts/
+private/
+*-referral.md
+*-referral/
+*.private.md
+*.local.md
+
+# Temporary dry-run output
+tmp/
+harness/tmp/

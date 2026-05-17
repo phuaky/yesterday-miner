@@ -1,0 +1,150 @@
+{
+  "name": "yesterday-miner",
+  "version": "0.1.0",
+  "description": "Product-agnostic Codex harness: mine signals, draft posts and DMs, route approvals through Telegram, and publish only after explicit approval.",
+  "sourceOfTruth": {
+    "productSpec": "../product.md",
+    "productTemplate": "../templates/product.template.md",
+    "harnessReadme": "README.md",
+    "verificationResult": "test-results/.last-run.json"
+  },
+  "commands": [
+    {
+      "name": "ralph",
+      "command": "bun ralph.ts",
+      "purpose": "Default mining loop.",
+      "sideEffects": ["telegram-send", "spec-log-write", "pending-draft-write"],
+      "safetyRequired": ["KILL_SWITCH", "DRY_RUN", "telegram-approval-before-publish"]
+    },
+    {
+      "name": "mine",
+      "command": "bun ralph.ts mine",
+      "purpose": "Score cached X and context moments, compose drafts, and queue them for Telegram approval.",
+      "sideEffects": ["codex-exec", "telegram-send", "spec-log-write", "pending-draft-write"],
+      "safetyRequired": ["KILL_SWITCH", "DRY_RUN", "content-filter"]
+    },
+    {
+      "name": "scout",
+      "command": "bun ralph.ts scout",
+      "purpose": "Extract engaged candidates from X cache, score fit, and queue manual DM drafts.",
+      "sideEffects": ["apify-read", "codex-exec", "telegram-send", "pending-draft-write", "spec-log-write"],
+      "safetyRequired": ["manual-dm-only", "telegram-approval-before-any-send"]
+    },
+    {
+      "name": "ingest",
+      "command": "bun ralph.ts ingest",
+      "purpose": "Fetch X cache and optional Discord cache for the configured lookback window.",
+      "sideEffects": ["apify-read", "discord-export-read", "cache-write"],
+      "safetyRequired": ["KILL_SWITCH"]
+    },
+    {
+      "name": "voice",
+      "command": "bun ralph.ts voice",
+      "purpose": "Build the generated voice profile from cached X history.",
+      "sideEffects": ["voice-profile-write", "codex-exec"],
+      "safetyRequired": ["generated-voice-profile-ignored"]
+    },
+    {
+      "name": "bot",
+      "command": "bun telegram/bot.ts",
+      "purpose": "Long-poll Telegram callback handler for approve, edit, redraft, skip, and stop actions.",
+      "sideEffects": ["telegram-read", "telegram-send", "x-post-after-approval", "spec-log-write", "pending-draft-write", "counter-write"],
+      "safetyRequired": ["DRY_RUN", "KILL_SWITCH", "content-filter", "daily-cap", "grace-period-stop"]
+    },
+    {
+      "name": "verify",
+      "command": "bun scripts/verify-harness",
+      "purpose": "Static and local safety checks. Writes test-results/.last-run.json.",
+      "sideEffects": ["verification-result-write"],
+      "safetyRequired": ["no-secret-printing", "no-runtime-mutation"]
+    }
+  ],
+  "env": [
+    { "name": "TELEGRAM_BOT_TOKEN", "secret": true, "requiredFor": ["telegram-approval", "dry-run-mine"] },
+    { "name": "TELEGRAM_CHAT_ID", "secret": true, "requiredFor": ["telegram-approval", "dry-run-mine"] },
+    { "name": "APIFY_TOKEN", "secret": true, "requiredFor": ["ingest:x", "scout-enrichment"] },
+    { "name": "X_HANDLE", "secret": false, "requiredFor": ["x-cache", "publish-url", "voice-profile"] },
+    { "name": "X_API_KEY", "secret": true, "requiredFor": ["live-publish"] },
+    { "name": "X_API_SECRET", "secret": true, "requiredFor": ["live-publish"] },
+    { "name": "X_ACCESS_TOKEN", "secret": true, "requiredFor": ["live-publish"] },
+    { "name": "X_ACCESS_TOKEN_SECRET", "secret": true, "requiredFor": ["live-publish"] },
+    { "name": "DISCORD_USER_TOKEN", "secret": true, "requiredFor": ["ingest:discord"] },
+    { "name": "DISCORD_CHANNELS", "secret": false, "requiredFor": ["ingest:discord", "context-lane"] },
+    { "name": "OPENAI_API_KEY", "secret": true, "requiredFor": ["codex-exec"] },
+    { "name": "CODEX_MODEL", "secret": false, "requiredFor": ["codex-exec"] },
+    { "name": "PRODUCT_SPEC_PATH", "secret": false, "requiredFor": ["spec-log", "dm-context"] },
+    { "name": "PRODUCT_NAME", "secret": false, "requiredFor": ["dm-context", "context-lane"] },
+    { "name": "OPERATOR_NAME", "secret": false, "requiredFor": ["voice-prompts"] },
+    { "name": "TARGET_AUDIENCE", "secret": false, "requiredFor": ["scoring"] },
+    { "name": "CONTEXT_NAME", "secret": false, "requiredFor": ["context-lane"] },
+    { "name": "PRODUCT_FIT_RUBRIC", "secret": false, "requiredFor": ["scout-fit"] },
+    { "name": "DRY_RUN", "secret": false, "requiredFor": ["safe-acceptance"] },
+    { "name": "KILL_SWITCH", "secret": false, "requiredFor": ["safe-startup"] },
+    { "name": "DAILY_POST_CAP", "secret": false, "requiredFor": ["live-publish"] },
+    { "name": "GRACE_PERIOD_SECONDS", "secret": false, "requiredFor": ["live-publish"] }
+  ],
+  "inputs": [
+    { "path": "../templates/product.template.md", "type": "public-template", "owner": "repo", "notes": "Generic 8-section product loop template." },
+    { "path": "../product.md", "type": "private-product-spec", "owner": "runtime", "notes": "Ignored local source of truth for a real product." },
+    { "path": "../campaigns/**", "type": "private-campaign-docs", "owner": "runtime", "notes": "Ignored product docs, drafts, trackers, and terms." },
+    { "path": ".env", "type": "local-config", "owner": "runtime", "notes": "Ignored; verifier checks key shape only." },
+    { "path": "cache/x/{date}.json", "type": "x-cache", "owner": "runtime", "notes": "Ignored generated data from Apify." },
+    { "path": "cache/discord/{channel}/{date}.json", "type": "discord-cache", "owner": "runtime", "notes": "Ignored generated data from Discord exporter." },
+    { "path": "voice/profile.md", "type": "voice-profile", "owner": "runtime", "notes": "Ignored generated voice anchor." },
+    { "path": "External tracker", "type": "prospect-tracker", "owner": "external", "notes": "Private tracker for segmentation and outreach status." }
+  ],
+  "outputs": [
+    { "path": "cache/pending-drafts.json", "type": "telegram-draft-state", "owner": "runtime", "ignored": true },
+    { "path": "cache/stop-flags.json", "type": "telegram-stop-state", "owner": "runtime", "ignored": true },
+    { "path": "cache/post-counter.json", "type": "publish-counter", "owner": "runtime", "ignored": true },
+    { "path": "../product.md#6", "type": "execution-log", "owner": "runtime", "ignored": true },
+    { "path": "test-results/.last-run.json", "type": "verification-result", "owner": "runtime", "ignored": true },
+    { "path": "Telegram approval inbox", "type": "human-approval-ui", "owner": "external", "ignored": false },
+    { "path": "X post", "type": "live-publish", "owner": "external", "ignored": false }
+  ],
+  "stateFiles": [
+    { "path": ".env", "policy": "ignored-secret-config" },
+    { "path": "../product.md", "policy": "ignored-private-product-spec" },
+    { "path": "../campaigns/", "policy": "ignored-private-campaigns" },
+    { "path": "../drafts/", "policy": "ignored-private-drafts" },
+    { "path": "cache/", "policy": "ignored-runtime-cache" },
+    { "path": "voice/profile.md", "policy": "ignored-generated-profile" },
+    { "path": "voice/corpus.jsonl", "policy": "ignored-generated-corpus" },
+    { "path": "log/", "policy": "ignored-runtime-logs" },
+    { "path": "test-results/.last-run.json", "policy": "ignored-verification-output" }
+  ],
+  "safetyGates": [
+    {
+      "name": "KILL_SWITCH",
+      "behavior": "If KILL_SWITCH=1, ralph.ts exits before running any command."
+    },
+    {
+      "name": "DRY_RUN",
+      "behavior": "If DRY_RUN=1, Telegram approval callbacks report the would-post text and do not call publishX."
+    },
+    {
+      "name": "telegram-approval-before-publish",
+      "behavior": "publishX is only reachable from telegram/bot.ts after an approve callback, content filter, pre-publish guard, and grace period."
+    },
+    {
+      "name": "grace-period-stop",
+      "behavior": "Approved drafts wait GRACE_PERIOD_SECONDS and can be cancelled with STOP before publish."
+    },
+    {
+      "name": "daily-cap",
+      "behavior": "recordPublish increments cache/post-counter.json only after a successful live post; checkPrePublish blocks after DAILY_POST_CAP."
+    },
+    {
+      "name": "manual-dm-only",
+      "behavior": "Scout drafts cold DMs to Telegram; it does not auto-send X DMs."
+    }
+  ],
+  "readinessGate": [
+    "Tracker columns ready",
+    "First segment selected",
+    "Message templates reviewed by the operator",
+    "Required product links confirmed",
+    "Operator eligibility/authority confirmed",
+    "Daily send cap defined"
+  ]
+}

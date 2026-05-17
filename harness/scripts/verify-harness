@@ -1,0 +1,282 @@
+#!/usr/bin/env bun
+
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { dirname, relative, resolve } from "node:path";
+import { criteria, pendingTasks, readSpec, unfulfilledHumanInputs } from "../parser/spec.ts";
+
+type Status = "pass" | "warn" | "fail";
+
+type Check = {
+  name: string;
+  status: Status;
+  evidence: string;
+  details?: string[];
+};
+
+type Manifest = {
+  name: string;
+  commands: Array<{ name: string; command: string; safetyRequired?: string[] }>;
+  env: Array<{ name: string; secret: boolean; requiredFor: string[] }>;
+  inputs: Array<{ path: string }>;
+  outputs: Array<{ path: string }>;
+  stateFiles: Array<{ path: string; policy: string }>;
+  safetyGates: Array<{ name: string; behavior: string }>;
+  readinessGate: string[];
+};
+
+const harnessRoot = resolve(import.meta.dir, "..");
+const projectRoot = resolve(harnessRoot, "..");
+const resultPath = resolve(harnessRoot, "test-results/.last-run.json");
+const checks: Check[] = [];
+
+function rel(path: string): string {
+  return relative(harnessRoot, path) || ".";
+}
+
+function add(name: string, status: Status, evidence: string, details?: string[]): void {
+  checks.push({ name, status, evidence, details });
+}
+
+function readJson<T>(path: string): T | null {
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as T;
+  } catch {
+    return null;
+  }
+}
+
+function envKeys(path: string): Set<string> {
+  if (!existsSync(path)) return new Set();
+  const keys = new Set<string>();
+  for (const rawLine of readFileSync(path, "utf8").split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+    if (m) keys.add(m[1]!);
+  }
+  return keys;
+}
+
+function allFiles(dir: string, out: string[] = []): string[] {
+  if (!existsSync(dir)) return out;
+  for (const name of readdirSync(dir)) {
+    if (name === "node_modules" || name === ".git") continue;
+    const path = resolve(dir, name);
+    const stat = statSync(path);
+    if (stat.isDirectory()) allFiles(path, out);
+    else out.push(path);
+  }
+  return out;
+}
+
+function gitCheckIgnored(pathFromProjectRoot: string): boolean | null {
+  if (!existsSync(resolve(projectRoot, ".git"))) return null;
+  const proc = Bun.spawnSync(["git", "-C", projectRoot, "check-ignore", "-q", pathFromProjectRoot]);
+  return proc.exitCode === 0;
+}
+
+const requiredFiles = [
+  resolve(projectRoot, "templates/product.template.md"),
+  resolve(harnessRoot, "README.md"),
+  resolve(harnessRoot, "package.json"),
+  resolve(harnessRoot, "harness.manifest.json"),
+  resolve(harnessRoot, ".env.example"),
+  resolve(harnessRoot, ".gitignore"),
+  resolve(projectRoot, ".gitignore"),
+  resolve(harnessRoot, "ralph.ts"),
+  resolve(harnessRoot, "lib/config.ts"),
+  resolve(harnessRoot, "parser/spec.ts"),
+  resolve(harnessRoot, "publish/safety.ts"),
+  resolve(harnessRoot, "publish/x-post.ts"),
+  resolve(harnessRoot, "telegram/bot.ts"),
+  resolve(harnessRoot, "telegram/send.ts"),
+  resolve(harnessRoot, "docs/architecture.md"),
+  resolve(harnessRoot, "docs/state-map.md"),
+  resolve(harnessRoot, "docs/events.md"),
+  resolve(harnessRoot, "docs/readiness-gate.md")
+];
+
+const missingFiles = requiredFiles.filter((path) => !existsSync(path)).map(rel);
+add(
+  "required files",
+  missingFiles.length === 0 ? "pass" : "fail",
+  missingFiles.length === 0 ? `${requiredFiles.length} required files exist.` : "Required files are missing.",
+  missingFiles
+);
+
+const manifestPath = resolve(harnessRoot, "harness.manifest.json");
+const manifest = readJson<Manifest>(manifestPath);
+if (!manifest) {
+  add("manifest parses", "fail", "harness.manifest.json is missing or invalid JSON.");
+} else {
+  const commandNames = new Set(manifest.commands.map((c) => c.name));
+  const gateNames = new Set(manifest.safetyGates.map((g) => g.name));
+  const requiredCommands = ["ralph", "mine", "scout", "ingest", "voice", "bot", "verify"];
+  const missingCommands = requiredCommands.filter((name) => !commandNames.has(name));
+  const missingGates = ["KILL_SWITCH", "DRY_RUN", "telegram-approval-before-publish", "grace-period-stop", "daily-cap", "manual-dm-only"].filter((name) => !gateNames.has(name));
+  add(
+    "manifest contract",
+    missingCommands.length === 0 && missingGates.length === 0 ? "pass" : "fail",
+    `Manifest declares ${manifest.commands.length} commands, ${manifest.env.length} env vars, and ${manifest.safetyGates.length} safety gates.`,
+    [...missingCommands.map((c) => `missing command: ${c}`), ...missingGates.map((g) => `missing safety gate: ${g}`)]
+  );
+
+  const exampleKeys = envKeys(resolve(harnessRoot, ".env.example"));
+  const envPath = resolve(harnessRoot, ".env");
+  const actualKeys = envKeys(envPath);
+  const missingExampleKeys = manifest.env.map((e) => e.name).filter((key) => !exampleKeys.has(key));
+  const safetyKeys = ["DRY_RUN", "KILL_SWITCH", "DAILY_POST_CAP", "GRACE_PERIOD_SECONDS"];
+  const missingSafetyKeys = safetyKeys.filter((key) => existsSync(envPath) && !actualKeys.has(key));
+  const dryRunKeys = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"];
+  const missingDryRunKeys = dryRunKeys.filter((key) => existsSync(envPath) && !actualKeys.has(key));
+  add(
+    ".env shape",
+    missingExampleKeys.length === 0 && missingSafetyKeys.length === 0 ? (missingDryRunKeys.length === 0 ? "pass" : "warn") : "fail",
+    existsSync(envPath)
+      ? `.env exists with ${actualKeys.size} keys; verifier checked key names only and printed no values.`
+      : ".env is absent; verifier checked .env.example only.",
+    [
+      ...missingExampleKeys.map((key) => `.env.example missing ${key}`),
+      ...missingSafetyKeys.map((key) => `.env missing safety key ${key}`),
+      ...missingDryRunKeys.map((key) => `.env missing dry-run Telegram key ${key}`)
+    ]
+  );
+}
+
+try {
+  const spec = readSpec(resolve(projectRoot, "templates/product.template.md"));
+  const sectionNumbers = [...spec.sections.keys()].sort((a, b) => a - b);
+  const missingSections = [1, 2, 3, 4, 5, 6, 7, 8].filter((n) => !spec.sections.has(n));
+  const crit = criteria(spec);
+  const needs = unfulfilledHumanInputs(spec);
+  const tasks = pendingTasks(spec);
+  add(
+    "spec parses",
+    missingSections.length === 0 && crit.length > 0 ? "pass" : "fail",
+    `Found sections ${sectionNumbers.join(", ")}; ${crit.length} criteria, ${needs.length} open human inputs, ${tasks.length} pending AI tasks.`,
+    missingSections.map((n) => `missing section ${n}`)
+  );
+} catch (error) {
+  add("spec parses", "fail", `Could not parse templates/product.template.md: ${(error as Error).message}`);
+}
+
+const docsToCheck = [
+  { path: resolve(harnessRoot, "README.md"), needles: ["DRY_RUN=1", "KILL_SWITCH=1", "GRACE_PERIOD_SECONDS"] },
+  { path: resolve(harnessRoot, "docs/architecture.md"), needles: ["product-agnostic", "Telegram", "DRY_RUN=1"] },
+  { path: resolve(harnessRoot, "docs/events.md"), needles: ["draft.approved", "post.dry_run", "KILL_SWITCH=1"] },
+  { path: resolve(harnessRoot, "docs/readiness-gate.md"), needles: ["Tracker columns ready", "Required product links confirmed", "Daily send cap defined"] }
+];
+const docMisses: string[] = [];
+for (const doc of docsToCheck) {
+  const text = existsSync(doc.path) ? readFileSync(doc.path, "utf8") : "";
+  for (const needle of doc.needles) {
+    if (!text.includes(needle)) docMisses.push(`${rel(doc.path)} missing "${needle}"`);
+  }
+}
+add(
+  "safety docs",
+  docMisses.length === 0 ? "pass" : "fail",
+  "Docs cover dry-run, kill switch, events, and readiness gate.",
+  docMisses
+);
+
+const tsFiles = allFiles(harnessRoot).filter((file) => file.endsWith(".ts"));
+const publishCallLocations: string[] = [];
+for (const file of tsFiles) {
+  const text = readFileSync(file, "utf8");
+  if (text.includes("publishX(")) publishCallLocations.push(rel(file));
+}
+const allowedPublishLocations = new Set(["publish/x-post.ts", "telegram/bot.ts"]);
+const disallowedPublishLocations = publishCallLocations.filter((file) => !allowedPublishLocations.has(file));
+const botText = readFileSync(resolve(harnessRoot, "telegram/bot.ts"), "utf8");
+const approvalNeedles = [
+  'action === "approve"',
+  "contentFilter(draft.body)",
+  "checkPrePublish()",
+  "gracePeriodSeconds()",
+  "setTimeout",
+  'process.env.DRY_RUN === "1"',
+  "publishX(draft.body)",
+  "recordPublish()"
+];
+const missingApprovalNeedles = approvalNeedles.filter((needle) => !botText.includes(needle));
+add(
+  "publish requires Telegram approval path",
+  disallowedPublishLocations.length === 0 && missingApprovalNeedles.length === 0 ? "pass" : "fail",
+  `publishX references found in: ${publishCallLocations.join(", ")}.`,
+  [...disallowedPublishLocations.map((file) => `unexpected publishX reference in ${file}`), ...missingApprovalNeedles.map((needle) => `telegram/bot.ts missing ${needle}`)]
+);
+
+const ignoredPaths = [
+  "AGENTS.md",
+  "CLAUDE.md",
+  "_TEMPLATE.md",
+  "product.md",
+  "products/private-product.md",
+  "campaigns/private-campaign/spec.md",
+  "drafts/private-draft.md",
+  "private/notes.md",
+  "example-referral.md",
+  "example-referral/private.md",
+  "harness/.env",
+  "harness/cache/.state",
+  "harness/voice/profile.md",
+  "harness/voice/corpus.jsonl",
+  "harness/log/.state",
+  "harness/miner/output/.state",
+  "harness/scout/output/.state",
+  "harness/test-results/.last-run.json"
+];
+const ignoreFailures: string[] = [];
+for (const path of ignoredPaths) {
+  const ignored = gitCheckIgnored(path);
+  if (ignored !== true) ignoreFailures.push(ignored === null ? `${path}: no git repo` : `${path}: not ignored`);
+}
+add(
+  "private and runtime state ignored",
+  ignoreFailures.length === 0 ? "pass" : "fail",
+  `${ignoredPaths.length} private/runtime paths checked with git check-ignore.`,
+  ignoreFailures
+);
+
+const packageJson = readJson<{ scripts?: Record<string, string> }>(resolve(harnessRoot, "package.json"));
+add(
+  "verify command",
+  packageJson?.scripts?.verify === "bun scripts/verify-harness" ? "pass" : "fail",
+  packageJson?.scripts?.verify ? `package script verify=${packageJson.scripts.verify}` : "package script verify is missing."
+);
+
+const status: Status = checks.some((check) => check.status === "fail")
+  ? "fail"
+  : checks.some((check) => check.status === "warn")
+    ? "warn"
+    : "pass";
+
+const result = {
+  status,
+  checkedAt: new Date().toISOString(),
+  harnessRoot,
+  projectRoot,
+  checks,
+  safetyEvidence: {
+    noSecretsPrinted: true,
+    externalApisCalled: false,
+    livePublishAttempted: false,
+    campaignScaleStarted: false
+  }
+};
+
+mkdirSync(dirname(resultPath), { recursive: true });
+writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+
+for (const check of checks) {
+  const symbol = check.status === "pass" ? "PASS" : check.status === "warn" ? "WARN" : "FAIL";
+  console.log(`${symbol} ${check.name}: ${check.evidence}`);
+  if (check.details?.length) {
+    for (const detail of check.details) console.log(`  - ${detail}`);
+  }
+}
+console.log(`\nresult: ${status}`);
+console.log(`wrote: ${rel(resultPath)}`);
+
+if (status === "fail") process.exit(1);

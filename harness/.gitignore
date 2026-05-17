@@ -1,0 +1,9 @@
+.env
+node_modules/
+cache/
+miner/output/
+scout/output/
+voice/corpus.jsonl
+voice/profile.md
+*.log
+.DS_Store
